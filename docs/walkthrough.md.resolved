@@ -1,0 +1,33 @@
+# TikTok Shop Affiliate Farm - Task 1 Walkthrough (RESOLVED)
+
+## 1. Phân Tích Yêu Cầu
+- **Mục tiêu:** Tự động hoá việc tạo và cấu hình 10 máy ảo LDPlayer 9.
+- **Ràng buộc phần cứng:** Dual Xeon E5-2680 v4, 96GB RAM. Cần tận dụng tốt GPU NVENC.
+- **Thông số máy ảo:** 2 Cores, 3072MB RAM.
+- **Spoofing:** IMEI, Android ID, Model (Pixel/Samsung).
+- **Tracking:** Lưu trạng thái vào `data/instances_state.json`.
+
+## 2. Kế Hoạch Triển Khai
+### Bước 1: Khởi tạo module `ld_manager.py`
+- Sử dụng `subprocess.run` để gọi `ldconsole.exe`.
+- Đường dẫn mặc định: `C:\LDPlayer\LDPlayer9\ldconsole.exe`.
+
+### Bước 2: Quản lý Instance
+- Hàm `create_instances()`: Kiểm tra danh sách hiện có, tạo mới nếu thiếu.
+- Format tên: `TikTok_US_01` -> `TikTok_US_10`.
+
+### Bước 3: Cấu hình và Spoofing
+- Sử dụng lệnh `modify` để set CPU/RAM.
+- Sử dụng lệnh `property` để set IMEI, Android ID, Manufacturer, Model.
+- Danh sách model dự kiến:
+    - Samsung: Galaxy S21 Ultra (SM-G998B), S22 Ultra (SM-S908B).
+    - Google: Pixel 6 Pro, Pixel 7 Pro.
+
+### Bước 4: Theo dõi trạng thái
+- Hàm `get_status()`: Gọi `ldconsole.exe isrunning`.
+- Ghi log trạng thái vào `data/instances_state.json` sau mỗi lần quét.
+
+## 3. Cách Kiểm Chiếu (Verification)
+- Kiểm tra số lượng máy ảo trong LDMultiPlayer.
+- Kiểm tra cấu hình RAM/CPU của từng máy.
+- Kiểm tra nội dung file `data/instances_state.json`.
