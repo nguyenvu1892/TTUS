@@ -1,33 +1,55 @@
-# TikTok Shop Affiliate Farm - Task 1 Walkthrough (RESOLVED)
+# Task 1 - Walkthrough Chi Tiết (RESOLVED LOG)
 
-## 1. Phân Tích Yêu Cầu
-- **Mục tiêu:** Tự động hoá việc tạo và cấu hình 10 máy ảo LDPlayer 9.
-- **Ràng buộc phần cứng:** Dual Xeon E5-2680 v4, 96GB RAM. Cần tận dụng tốt GPU NVENC.
-- **Thông số máy ảo:** 2 Cores, 3072MB RAM.
-- **Spoofing:** IMEI, Android ID, Model (Pixel/Samsung).
-- **Tracking:** Lưu trạng thái vào `data/instances_state.json`.
+## Phân Tích & Kế Hoạch
 
-## 2. Kế Hoạch Triển Khai
-### Bước 1: Khởi tạo module `ld_manager.py`
-- Sử dụng `subprocess.run` để gọi `ldconsole.exe`.
-- Đường dẫn mặc định: `C:\LDPlayer\LDPlayer9\ldconsole.exe`.
+### Yêu cầu được xác định
+| Hạng mục | Giá trị |
+|---|---|
+| Số instance | 10 |
+| Tên format | `TikTok_US_01` → `TikTok_US_10` |
+| RAM | 3072 MB |
+| CPU | 2 Cores |
+| Spoofing | IMEI (Luhn), Android ID (hex-16), Manufacturer, Model |
+| State file | `data/instances_state.json` |
+| LDConsole path | `C:\LDPlayer\LDPlayer9\ldconsole.exe` |
 
-### Bước 2: Quản lý Instance
-- Hàm `create_instances()`: Kiểm tra danh sách hiện có, tạo mới nếu thiếu.
-- Format tên: `TikTok_US_01` -> `TikTok_US_10`.
+### Quyết định thiết kế
+- Dùng `ldconsole copy --from 0` để tạo instance mới (nhanh hơn `add`)
+- IMEI được tạo theo thuật toán Luhn để đảm bảo tính hợp lệ
+- Device profile được random mỗi lần gọi `configure_all_instances()`
+- Log ghi ra cả file (`data/ld_manager.log`) và stdout
+- State JSON có timestamp ISO-8601 để audit trail
 
-### Bước 3: Cấu hình và Spoofing
-- Sử dụng lệnh `modify` để set CPU/RAM.
-- Sử dụng lệnh `property` để set IMEI, Android ID, Manufacturer, Model.
-- Danh sách model dự kiến:
-    - Samsung: Galaxy S21 Ultra (SM-G998B), S22 Ultra (SM-S908B).
-    - Google: Pixel 6 Pro, Pixel 7 Pro.
+## Triển Khai
 
-### Bước 4: Theo dõi trạng thái
-- Hàm `get_status()`: Gọi `ldconsole.exe isrunning`.
-- Ghi log trạng thái vào `data/instances_state.json` sau mỗi lần quét.
+### Files đã tạo
+- `ld_manager.py` — Module chính (standalone, stdlib only)
+- `data/instances_state.json` — Template state file
+- `requirements.txt` — Không cần package ngoài
+- `.gitignore` — Loại trừ log, pycache, env
 
-## 3. Cách Kiểm Chiếu (Verification)
-- Kiểm tra số lượng máy ảo trong LDMultiPlayer.
-- Kiểm tra cấu hình RAM/CPU của từng máy.
-- Kiểm tra nội dung file `data/instances_state.json`.
+### Các lệnh `ldconsole.exe` được sử dụng
+| Lệnh | Mục đích |
+|---|---|
+| `list2` | Lấy danh sách instance hiện có |
+| `copy --name <n> --from 0` | Tạo instance mới từ index 0 |
+| `modify --index <i> --cpu 2 --memory 3072` | Set CPU/RAM |
+| `property put --index <i> --propName ... --propValue ...` | Spoof device props |
+| `modifyIMEI --index <i> --imei <n>` | Set IMEI |
+| `modifyandroidid --index <i> --androidid <n>` | Set Android ID |
+| `isrunning --index <i>` | Kiểm tra trạng thái |
+
+## Cấu trúc file `instances_state.json`
+```json
+{
+  "timestamp": "2026-03-05T23:15:00+0700",
+  "instances": {
+    "TikTok_US_01": {"index": 1, "status": "stopped"},
+    ...
+    "TikTok_US_10": {"index": 10, "status": "stopped"}
+  }
+}
+```
+
+## Trạng thái
+✅ Task 1 hoàn tất. Sẵn sàng thực thi khi LDPlayer đang chạy.

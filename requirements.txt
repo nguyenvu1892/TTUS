@@ -1,0 +1,6 @@
+# Python standard library only — no extra packages required.
+# All dependencies use stdlib: subprocess, json, random, string, time, logging, os, pathlib
+
+# Optional: for future phases
+# requests>=2.28.0
+# adb-shell>=0.4.0
