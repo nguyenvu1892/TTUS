@@ -227,7 +227,7 @@ def configure_instance(index: int, name: str) -> None:
         "--index", index,
         "--cpu", TARGET_CPU_CORES,
         "--memory", TARGET_RAM_MB,
-        "--resolution", "1080,1920,480",    # FullHD portrait, 480dpi
+        "--resolution", "720,1280,320",     # Mobile 9:16 portrait, 320dpi — khop voi toa do ADB Task 3
         "--imei", "auto",
         "--androidid", "auto",
     )
