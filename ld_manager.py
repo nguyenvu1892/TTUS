@@ -22,16 +22,46 @@ import os
 from pathlib import Path
 from typing import Optional
 
+
 # ===========================================================================
-# CONFIGURATION
+# CONFIG LOADER  (đọc từ config.json — KHÔNG hardcode path)
 # ===========================================================================
 
-LD_CONSOLE_PATH = r"C:\LDPlayer\LDPlayer9\ldconsole.exe"
+CONFIG_FILE = Path(__file__).parent / "config.json"
 
-INSTANCE_COUNT = 10
-INSTANCE_PREFIX = "TikTok_US_"
-TARGET_RAM_MB = 3072
-TARGET_CPU_CORES = 2
+
+def load_config() -> dict:
+    """
+    Đọc config.json và trả về dict cấu hình.
+    Raise FileNotFoundError nếu thiếu file, KeyError nếu thiếu key bắt buộc.
+    """
+    if not CONFIG_FILE.exists():
+        raise FileNotFoundError(
+            f"[CONFIG] Không tìm thấy file cấu hình: {CONFIG_FILE}\n"
+            f"Hãy tạo file config.json với key 'LDPLAYER_PATH'."
+        )
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    if "LDPLAYER_PATH" not in cfg:
+        raise KeyError(
+            "[CONFIG] Thiếu key 'LDPLAYER_PATH' trong config.json."
+        )
+    return cfg
+
+
+CFG = load_config()
+
+# ===========================================================================
+# CONFIGURATION  (giá trị lấy từ CFG đọc config.json)
+# ===========================================================================
+
+# Ghép ldconsole.exe từ LDPLAYER_PATH trong config — KHÔNG hardcode
+LD_CONSOLE_PATH = str(Path(CFG["LDPLAYER_PATH"]) / "ldconsole.exe")
+
+INSTANCE_COUNT   = int(CFG.get("INSTANCE_COUNT",   10))
+INSTANCE_PREFIX  = str(CFG.get("INSTANCE_PREFIX",  "TikTok_US_"))
+TARGET_RAM_MB    = int(CFG.get("TARGET_RAM_MB",    3072))
+TARGET_CPU_CORES = int(CFG.get("TARGET_CPU_CORES", 2))
 
 STATE_FILE = Path(__file__).parent / "data" / "instances_state.json"
 LOG_FILE = Path(__file__).parent / "data" / "ld_manager.log"

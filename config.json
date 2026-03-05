@@ -1,0 +1,7 @@
+{
+    "LDPLAYER_PATH": "C:\\LDPlayer\\LDPlayer9",
+    "INSTANCE_COUNT": 10,
+    "INSTANCE_PREFIX": "TikTok_US_",
+    "TARGET_RAM_MB": 3072,
+    "TARGET_CPU_CORES": 2
+}
