@@ -1,8 +1,36 @@
 # TikTok Shop Affiliate Farm - Project Walkthrough
 
-## Phân Tích & Kế Hoạch (Task 1)
-- **Git:** Đã khởi tạo nhánh `feature/task1-ldplayer-setup`.
-- **Mục tiêu:** Tạo 10 máy ảo LDPlayer 9 (`TikTok_US_01` -> `TikTok_US_10`).
-- **Cấu hình:** 2 Cores, 3072MB RAM.
-- **Spoofing:** IMEI, Android ID, Model (Pixel/Samsung).
-- **Trạng thái:** Kế hoạch đã sẵn sàng trong `docs/walkthrough.md.resolved`.
+## Task 1: LDPlayer Instance Management (Completed)
+**Branch:** `feature/task1-ldplayer-setup`
+**File chính:** `ld_manager.py`
+
+### Cấu trúc dự án
+```
+TikTokUS/
+├── ld_manager.py           # Core automation script
+├── requirements.txt        # Deps (stdlib only)
+├── .gitignore
+├── data/
+│   └── instances_state.json  # Trạng thái runtime của 10 instance
+└── docs/
+    ├── walkthrough.md          # File này (tóm tắt kiến trúc)
+    └── walkthrough.md.resolved # Log chi tiết theo task
+```
+
+### Luồng hoạt động `ld_manager.py`
+1. **`create_instances()`** — Dùng `ldconsole copy` để clone instance từ index 0 với tên `TikTok_US_01..10`
+2. **`configure_instance(index, name)`** — Dùng `ldconsole modify` để set CPU=2, RAM=3072MB; `ldconsole property put` để spoof manufacturer/model
+3. **`get_instance_status(index)`** — Dùng `ldconsole isrunning --index n` → trả về `running/stopped/error`
+4. **`save_state()`** — Ghi dict trạng thái vào `data/instances_state.json`
+
+### Device Library
+- Samsung: SM-G998B (S21U), SM-S908B (S22U), SM-G996B (S21+), SM-A546B (A54), SM-A336B (A33)
+- Google: Pixel 6, Pixel 6 Pro, Pixel 7, Pixel 7 Pro
+- OnePlus: CPH2451 (OP11)
+
+### Sử dụng
+```bash
+python ld_manager.py setup      # Full: Create + Configure + Status
+python ld_manager.py status     # Chỉ query trạng thái
+python ld_manager.py list       # Liệt kê instance
+```
