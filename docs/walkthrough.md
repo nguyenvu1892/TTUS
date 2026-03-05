@@ -89,4 +89,39 @@ python proxy_manager.py install    # Chỉ cài APK (APK phải có sẵn)
 python proxy_manager.py configure  # Chỉ cấu hình proxy qua ADB Intent
 ```
 
-> ✅ **Task 2 HOÀN TẤT & VERIFIED** — Đã merge vào `main`. Syntax clean, deps documented.
+> ✅ **Task 2 HOÀN TẤT & VERIFIED** — Đã merge vào `main` tại commit `9ebdce3`. APK auto-download, colorama colors, bootstrap deps.
+
+---
+
+## Task 3: TikTok Account Warming (Hoàn tất)
+**Branch:** `feature/task3-account-warming`
+**File mới:** `tiktok_farmer.py`
+
+### Mục tiêu
+Giả lập hành vi lướt FYP của người thật trên 10 VM song song để xây dựng Device Trust Score.
+
+### Thuật toán Humanize
+- **X-axis:** `Gaussian(μ=540, σ=75px)` — không bao giờ chạm chính tâm
+- **Duration:** `Log-Normal(μ=350ms, σ=0.4)` — phân phối lệch phải như ngón tay thật [180–800ms]
+- **Retention:** Uniform 7–35s | 8% chance "video hay" 45–60s
+- **Like:** 10–15% xác suất | double-tap | min 5 video cách nhau giữa 2 lần like
+
+### Concurrency: ThreadPoolExecutor
+I/O-bound workload (90% sleep + ADB) → Thread đủ, GIL không phải bottleneck.
+`ProcessPoolExecutor` sẽ fork process tốn ~50-100MB RAM/proc không cần thiết.
+
+### config.json (keys mới)
+```json
+"TIKTOK_PACKAGE": "com.ss.android.ugc.trill",
+"SCREEN_WIDTH": 1080,  "SCREEN_HEIGHT": 1920,
+"SESSION_MIN_SEC": 900, "SESSION_MAX_SEC": 1200,
+"REST_MIN_HOURS": 2,   "REST_MAX_HOURS": 4
+```
+
+### Sử dụng
+```bash
+python tiktok_farmer.py start       # Farm 10 VM song song (15–20 phút/phiên)
+python tiktok_farmer.py session 1   # Dry-run 1 phiên cho VM index 1
+```
+
+> ✅ **Task 3 HOÀN TẤT & VERIFIED** — Đã merge vào `main`. Syntax clean, ThreadPoolExecutor, humanized swipe.

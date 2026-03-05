@@ -2,13 +2,13 @@
 # Mỗi dòng tương ứng với 1 VM (dòng 1 = VM index 1, ..., dòng 10 = VM index 10)
 # Thay thế bằng thông tin proxy US thực tế trước khi chạy proxy_manager.py
 
-198.12.64.101:1080:user_us_01:p@ssW0rd_01
-198.12.64.102:1080:user_us_02:p@ssW0rd_02
-198.12.64.103:1080:user_us_03:p@ssW0rd_03
-198.12.64.104:1080:user_us_04:p@ssW0rd_04
-198.12.64.105:1080:user_us_05:p@ssW0rd_05
-198.12.64.106:1080:user_us_06:p@ssW0rd_06
-198.12.64.107:1080:user_us_07:p@ssW0rd_07
-198.12.64.108:1080:user_us_08:p@ssW0rd_08
-198.12.64.109:1080:user_us_09:p@ssW0rd_09
-198.12.64.110:1080:user_us_10:p@ssW0rd_10
+sp08v5-us01.muaproxymmo.com:12194:sp08-12194:PEBTA
+sp08v5-us07.proxysystem.net:14793:sp08v5-14793:OWGBI
+sp08v5-us06.proxysystem.net:14091:sp08v5-14091:UIQGH
+sp08v5-us05.muaproxymmo.com:13866:sp08v5-13866:YMKDI
+sp08v5-us01.muaproxymmo.com:12077:sp08-12077:CHYEF
+sp08v5-us06.proxysystem.net:14221:sp08v5-14221:TDYWQ
+sp08v5-us07.proxysystem.net:14614:sp08v5-14614:FPEHB
+sp08v5-us01.muaproxymmo.com:12101:sp08-12101:CAPYL
+sp08v5-us05.muaproxymmo.com:13829:sp08v5-13829:AWSNC
+sp08v5-us01.muaproxymmo.com:12033:sp08-12033:PJIUX

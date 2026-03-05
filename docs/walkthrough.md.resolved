@@ -1,199 +1,152 @@
-# Task 2 - Phân Tích & Kế Hoạch Triển Khai (PLANNING LOG)
+# Task 3 - Phân Tích & Kế Hoạch Triển Khai (PLANNING LOG)
 
-## I. Phân Tích Khả Thi: Lựa Chọn Ứng Dụng Proxy
-
-### Tiêu chí đánh giá
-Ứng dụng phải hỗ trợ **cấu hình hoàn toàn qua ADB (không cần tương tác thủ công)**, bao gồm:
-1. Nhận IP, Port, Username, Password từ dòng lệnh
-2. Tự kích hoạt kết nối
+## I. Phân Tích Kỹ Thuật
 
 ---
 
-### Bảng So Sánh
+### Vấn đề 1: Thuật Toán Tọa Độ Vuốt Chống Phát Hiện Bot
 
-| Tiêu chí | SocksDroid | Postern | SuperProxy |
-|---|---|---|---|
-| **Mã nguồn mở** | ✅ GPL-3.0 (GitHub) | ❌ Closed source | ❌ Closed source |
-| **ADB Intent API** | ✅ **Có, được tài liệu hóa đầy đủ** | ❌ Không có | ❌ Không có |
-| **Giao thức** | SOCKS5 (full) | SOCKS5/HTTP | HTTP/SOCKS |
-| **Không cần root** | ✅ VPNService API | ✅ | ✅ |
-| **Android 9+ compat** | ✅ (fork bndeff/socksdroid) | ✅ | ⚠️ Không xác định |
-| **Khả năng tự động hóa** | 🏆 **Tốt nhất** | ❌ Không khả thi | ❌ Không khả thi |
+#### Tại sao TikTok phát hiện được thao tác máy móc?
+TikTok AI theo dõi các tín hiệu:
+- **Độ lặp lại tọa độ:** Vuốt đúng `(540, 1600) → (540, 400)` liên tục 100 lần → đặc trưng bot.
+- **Tốc độ tuyến tính:** `adb shell input swipe x1 y1 x2 y2 duration` với duration cố định → không tự nhiên.
+- **Thời gian giữa các hành động:** Interval chính xác tới millisecond giữa mỗi swipe.
+- **Điểm chạm quá hoàn hảo:** Luôn chạm chính giữa màn hình (540px trên màn hình 1080px).
 
----
+#### Giải pháp: Mô hình Swipe Ngẫu Nhiên Hóa 3 Chiều
 
-### Phân Tích Chi Tiết
-
-#### ✅ SocksDroid — ĐƯỢC CHỌN
-- **Package:** `net.typeblog.socks` (fork: `com.kongdao.socks`)
-- **APK:** Tải từ GitHub Releases `bndeff/socksdroid` (GPL-3.0)
-- **Cơ chế:** Dùng `am start -n` với các Intent extras sau:
-
-| Intent Extra | Flag | Ý nghĩa |
-|---|---|---|
-| `intent_ip` | `--es` | SOCKS5 server IP |
-| `intent_port` | `--ei` | SOCKS5 port (int) |
-| `intent_user` | `--es` | Username |
-| `intent_pass` | `--es` | Password |
-| `intent_start` | `--ez` | `true` = kích hoạt VPN ngay |
-
-**ADB command mẫu:**
-```bash
-adb shell am start -n net.typeblog.socks/.MainActivity \
-  --es intent_ip 1.2.3.4 \
-  --ei intent_port 1080 \
-  --es intent_user myuser \
-  --es intent_pass mypass \
-  --ez intent_start true
 ```
-> Lệnh này vừa cấu hình vừa kích hoạt kết nối SOCKS5 trong một bước duy nhất.
+SwipeVector = BaseVector + OffsetNoise + CurveNoise
+```
 
-#### ❌ Postern
-- Closed source, không expose bất kỳ ADB Intent API nào. Không thể tự động hóa.
+**1. Offset tọa độ X (lệch ngang):**
+```python
+import random, math
 
-#### ❌ SuperProxy
-- Closed source, không có tài liệu tự động hóa ADB. Không khả thi.
+SCREEN_W, SCREEN_H = 1080, 1920
+CENTER_X = SCREEN_W // 2  # 540
+
+# Lệch tâm ngang: ±15% chiều rộng (người thật không vuốt chính tâm)
+x_start = int(random.gauss(CENTER_X, SCREEN_W * 0.07))
+x_start = max(200, min(880, x_start))  # clamp
+
+# Điểm kết thúc lệch một chút so với điểm bắt đầu (drift ngang)
+x_end = x_start + int(random.gauss(0, 18))
+```
+
+**2. Offset tọa độ Y (biên độ vuốt):**
+```python
+# Điểm bắt đầu: vùng giữa-dưới màn hình
+y_start = int(random.uniform(SCREEN_H * 0.65, SCREEN_H * 0.78))  # 1248–1498px
+
+# Biên độ vuốt: 48–72% chiều cao (không bao giờ full-screen)
+swipe_ratio = random.uniform(0.48, 0.72)
+y_end = int(y_start - SCREEN_H * swipe_ratio)
+y_end = max(180, y_end)  # không kéo quá sát đỉnh
+```
+
+**3. Duration (tốc độ vuốt) — Log-Normal phân phối:**
+```python
+# Log-normal tạo đuôi dài về phía chậm, giống ngón tay thật
+# mean=350ms, sigma khiến dao động từ ~180ms đến ~800ms
+duration_ms = int(random.lognormvariate(math.log(350), 0.4))
+duration_ms = max(180, min(800, duration_ms))
+```
+
+**4. Lệnh ADB kết quả:**
+```bash
+adb shell input swipe {x_start} {y_start} {x_end} {y_end} {duration_ms}
+```
+> Wrapper qua `ldconsole adb --index <i> --command "..."` để dùng ADB bridge của LDPlayer.
+
+**5. Post-Swipe Micro-pause (entropy bổ trợ):**
+```python
+# Khoảng nghỉ nhỏ sau swipe trước khi đếm thời gian xem
+time.sleep(random.uniform(0.08, 0.35))
+```
+
+**Tổng kết:** Mỗi lần vuốt tạo ra một vector duy nhất (x, y, duration) từ phân phối thống kê, không bao giờ lặp lại chính xác. Bot nhìn như người.
+
+---
+
+### Vấn đề 2: ThreadPoolExecutor vs ProcessPoolExecutor
+
+#### Đặc điểm workload của hệ thống này
+| Thuộc tính | Phân tích |
+|---|---|
+| CPU-bound? | **KHÔNG** — bottleneck là `time.sleep()` + ADB I/O, không phải tính toán |
+| I/O-bound? | **CÓ** — mỗi VM chủ yếu ngủ (retention time) + chờ ADB response |
+| GIL impact? | Không quan trọng — không có vòng lặp Python tight nào |
+| Shared state? | Nhẹ — chỉ đọc config và proxy list (read-only) |
+| Inter-process overhead? | Không cần serialize dữ liệu phức tạp |
+
+#### Quyết định: `ThreadPoolExecutor` ✅
+
+**Lý do:**
+1. **I/O-bound workload:** 90%+ thời gian là `time.sleep()` (retention) + `subprocess.run()` (ADB roundtrip). Thread nhàn rỗi khi ngủ — GIL được release hoàn toàn trong `time.sleep()` và `subprocess`.
+2. **Chia sẻ trạng thái dễ dàng:** Tất cả 10 thread có thể đọc cùng `config` dict và `proxies` list mà không cần serialize.
+3. **Overhead thấp hơn:** `ProcessPoolExecutor` cần fork 10 process con, mỗi process có Python interpreter riêng, tốn thêm ~50–100 MB RAM/process cho workload này là không cần thiết.
+4. **56 luồng CPU:** `ThreadPoolExecutor(max_workers=10)` chỉ dùng 10 thread OS — hoàn toàn phù hợp, không cần match với số core vì không CPU-bound.
+
+> `ProcessPoolExecutor` chỉ nên dùng nếu có tác vụ CPU-bound nặng (ví dụ: xử lý ảnh/video, ML inference). Không phải trường hợp này.
+
+**Cấu hình:**
+```python
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+INSTANCE_COUNT = 10
+with ThreadPoolExecutor(max_workers=INSTANCE_COUNT) as pool:
+    futures = {pool.submit(run_session, i): i for i in range(1, INSTANCE_COUNT + 1)}
+    for future in as_completed(futures):
+        idx = futures[future]
+        result = future.result()
+        logger.info(f"VM {idx:02d} kết thúc phiên: {result}")
+```
 
 ---
 
 ## II. Kế Hoạch Triển Khai (Implementation Plan)
 
-### Tổng quan luồng
+### Cấu trúc module `tiktok_farmer.py`
+
 ```
-proxies_list.txt (10 dòng)
-        ↓ đọc bởi
-proxy_manager.py
-        ↓ dùng ldconsole
-  installapp → SocksDroid APK vào 10 VM
-        ↓ dùng ldconsole adb
-  am start → cấu hình + kích hoạt proxy trên từng VM
+tiktok_farmer.py
+│
+├── _humanized_swipe(ld_console, index)  — Tạo vector swipe ngẫu nhiên hoá
+├── _humanized_watch(ld_console, index)  — Sleep retention time (7–60s)
+├── _maybe_like(ld_console, index)       — 10-15% xác suất double tap
+├── _open_tiktok(ld_console, index)      — am start TikTok package
+├── _kill_tiktok(ld_console, index)      — am force-stop
+├── run_session(index, proxy, cfg)       — 1 phiên đầy đủ (15-20 phút)
+└── farm_all(cfg, proxies)               — ThreadPoolExecutor cho 10 VM
 ```
 
-### File mới cần tạo
+### Thông số hành vi (Humanize Parameters)
+| Tham số | Giá trị | Ghi chú |
+|---|---|---|
+| Retention bình thường | 7 – 35 giây | `random.uniform(7, 35)` |
+| Retention "video hay" | 45 – 60 giây | Xác suất 8% |
+| Xác suất like | 10 – 15% | Double tap tại vùng trung tâm ± jitter |
+| Thời gian phiên | 15 – 20 phút | `random.uniform(900, 1200)` giây |
+| Nghỉ giữa phiên | 2 – 4 tiếng | Config trong `config.json` |
 
-| File | Vai trò |
+### File cần tạo/cập nhật
+| File | Thao tác |
 |---|---|
-| `data/proxies_list.txt` | 10 dòng proxy giả định (`IP:Port:User:Pass`) |
-| `proxy_manager.py` | Module tự động hóa cài đặt & cấu hình proxy |
+| `tiktok_farmer.py` | NEW — module chính |
+| `config.json` | UPDATE — thêm `FARMER_*` keys |
+| `docs/walkthrough.md` | UPDATE — thêm section Task 3 |
+| `requirements.txt` | Không thay đổi (stdlib + requests + colorama đủ) |
 
-### File cần cập nhật
-
-| File | Thay đổi |
+### ADB Commands sử dụng
+| Lệnh | Mục đích |
 |---|---|
-| `config.json` | Thêm key `SOCKSDROID_APK_PATH` |
-
----
-
-### Thiết Kế Module `proxy_manager.py`
-
-#### Cấu trúc chính
-```python
-# proxy_manager.py
-#
-# Chức năng:
-#   1. load_proxies()          — Đọc data/proxies_list.txt → list[dict]
-#   2. install_app(index)      — ldconsole installapp → SocksDroid APK
-#   3. configure_proxy(index, proxy) — ldconsole adb → am start intent
-#   4. setup_all()             — Full pipeline cho 10 instance
-#
-# Chia sẻ config.json với ld_manager.py (LDPLAYER_PATH, INSTANCE_COUNT)
-```
-
-#### Chi Tiết Hàm
-
-**`load_proxies(path) -> list[dict]`**
-- Đọc file `data/proxies_list.txt`
-- Parse từng dòng theo format `IP:Port:User:Pass`
-- Trả về list of dict: `{"ip": ..., "port": ..., "user": ..., "pass": ...}`
-
-**`install_app(ld_console_path, index, apk_path)`**
-```
-ldconsole installapp --index <i> --filename <apk_path>
-```
-- Cài SocksDroid APK vào VM index `i`
-
-**`configure_proxy(ld_console_path, index, proxy: dict)`**
-```
-ldconsole adb --index <i> --command "am start -n net.typeblog.socks/.MainActivity
-  --es intent_ip <ip> --ei intent_port <port>
-  --es intent_user <user> --es intent_pass <pass> --ez intent_start true"
-```
-- Gửi Intent qua LDPlayer ADB bridge — không cần ADB server riêng
-
-**`setup_all()`**
-- Gọi `install_app()` cho 10 instance (index 1..10), tuần tự
-- Chờ 2s giữa các bước để OS xử lý
-- Gọi `configure_proxy()` cho 10 instance với proxy tương ứng từ list
-- Log kết quả ra stdout và `data/ld_manager.log`
-
-#### CLI Interface
-```bash
-python proxy_manager.py install   # Chỉ cài APK cho 10 VM
-python proxy_manager.py configure # Chỉ cấu hình proxy (APK đã cài)
-python proxy_manager.py setup     # Full: cài + cấu hình
-```
-
----
-
-### Format `data/proxies_list.txt`
-```
-# Format: IP:Port:Username:Password (1 dòng = 1 VM)
-# VM index 1 dùng dòng 1, VM index 2 dùng dòng 2, ...
-198.12.64.1:1080:user_us_01:pass_us_01
-198.12.64.2:1080:user_us_02:pass_us_02
-...
-198.12.64.10:1080:user_us_10:pass_us_10
-```
-
-### Cập nhật `config.json`
-```json
-{
-  "LDPLAYER_PATH": "C:\\LDPlayer\\LDPlayer9",
-  "INSTANCE_COUNT": 10,
-  "INSTANCE_PREFIX": "TikTok_US_",
-  "TARGET_RAM_MB": 3072,
-  "TARGET_CPU_CORES": 2,
-  "SOCKSDROID_APK_PATH": "data\\socksdroid.apk"
-}
-```
-
----
-
-### Rủi Ro & Biện Pháp Xử Lý
-
-| Rủi ro | Xử lý |
-|---|---|
-| VM chưa chạy khi gọi `adb` | Check `isrunning` trước; skip + log nếu stopped |
-| APK path sai | Validate file exists lúc load config; exit sớm |
-| VPN permission dialog chặn | VPNService yêu cầu user confirm lần đầu — **cần thao tác thủ công 1 lần/VM** |
-| Intent extra sai type | `intent_port` phải là `--ei` (int), không phải `--es` |
-
-> ⚠️ **Lưu ý VPN Permission:** Android yêu cầu user xác nhận VPN connection lần đầu. Script sẽ log cảnh báo và hướng dẫn thực hiện thủ công 1 lần cho mỗi VM trước khi tự động hóa hoạt động.
+| `am start -n com.ss.android.ugc.trill/.main.MainActivity` | Mở TikTok |
+| `am force-stop com.ss.android.ugc.trill` | Kill TikTok |
+| `input swipe x1 y1 x2 y2 duration` | Vuốt FYP |
+| `input tap x y` | Double tap like |
 
 ---
 
 ## Trạng thái
-📋 **Task 2 đang ở giai đoạn PLANNING — chờ lệnh PROCEED từ Tech Lead.**
-
----
-
-## Triển Khai
-
-### Files đã tạo / cập nhật
-| File | Thay đổi |
-|---|---|
-| `proxy_manager.py` | Module mới — full pipeline install + configure |
-| `data/proxies_list.txt` | File proxy mẫu 10 dòng (IP:Port:User:Pass) |
-| `config.json` | Thêm key `SOCKSDROID_APK_PATH` |
-| `docs/walkthrough.md` | Thêm section Task 2 |
-
-### Kết Quả Verification
-| Kiểm tra | Kết quả |
-|---|---|
-| Python syntax check (`py_compile`) | ✅ PASSED |
-| `config.json` cấu trúc hợp lệ | ✅ PASSED (6 keys) |
-| `proxies_list.txt` có 10 dòng proxy | ✅ PASSED |
-| Git branch `feature/task2-proxy-setup` | ✅ Đã tạo |
-
-## Trạng thái
-✅ **Task 2 CODE HOÀN TẤT.** Chờ Tech Lead download APK thật và test thực tế.
+📋 **Task 3 đang ở giai đoạn PLANNING — chờ lệnh PROCEED từ Tech Lead.**
