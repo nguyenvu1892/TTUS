@@ -188,47 +188,45 @@ def _random_device_profile() -> dict:
 # INSTANCE CONFIGURATION
 # ===========================================================================
 
-def configure_instance(index: int, name: str) -> None:
+def configure_base_instance() -> None:
     """
-    Cau hinh CPU, RAM, Resolution, Root, ADB va device spoofing cho mot instance.
+    Cau hinh may ao GOC (index 0 / LDPlayer) lam TEMPLATE truoc khi copy.
 
-    Cac tham so quan trong:
-      --root 1    : Bat quyen Root trong may ao (bat buoc cho ADB su -c)
-      --adb 1     : Bat ket noi ADB qua mang noi bo (bat buoc cho proxy_manager.py)
-      --resolution: Ep may ao ve Mobile 9:16 720x1280 320dpi cho toa do ADB chinh xac
+    Chien luoc Copy-from-Base:
+      - "ldconsole modify" ap dung len may ao copy KHONG persist (bug LDPlayer).
+      - Giai phap: cau hinh may goc index=0 mot lan duy nhat voi Root+ADB+Res+CPU+RAM.
+      - Sau do moi "copy --from 0" de tao 10 may con -> 100% ke thua cau hinh.
+      - configure_instance() chi can chay Device Spoofing (IMEI, model...) tren may con.
     """
-    log.info(f"[CONFIG] Dang cau hinh {name} (index={index})...")
-
-    # 1. Set CPU, RAM, Resolution, Root, ADB
+    log.info("[BASE] Dang cau hinh may ao GOC (index=0) lam Template ...")
     result = ld_command(
         "modify",
-        "--index",      index,
+        "--index",      "0",
         "--cpu",        TARGET_CPU_CORES,
         "--memory",     TARGET_RAM_MB,
         "--resolution", "720,1280,320",  # Mobile 9:16 portrait, 320dpi
-        "--root",       "1",             # BAT ROOT -- bat buoc cho ADB su -c
-        "--adb",        "1",             # BAT ADB mang noi bo -- bat buoc cho proxy/farmer
-        "--imei",       "auto",
-        "--androidid",  "auto",
+        "--root",       "1",             # BAT ROOT
+        "--adb",        "1",             # BAT ADB mang noi bo
     )
     if result.returncode == 0:
         log.info(
-            f"  [OK] Set CPU={TARGET_CPU_CORES}, RAM={TARGET_RAM_MB}MB, "
-            f"Resolution=720x1280, Root=ON, ADB=ON cho {name}"
+            f"[BASE] Template OK: CPU={TARGET_CPU_CORES}, RAM={TARGET_RAM_MB}MB, "
+            "Resolution=720x1280, Root=ON, ADB=ON."
         )
+        log.info("[BASE] Cac may ao duoc copy --from 0 se ke thua toan bo cau hinh nay.")
     else:
-        log.warning(f"  [WARN] modify loi cho {name}: {result.stderr.strip()}")
-        # Fallback: lenh ngan hon cho ldconsole phien ban cu
-        ld_command(
-            "modify",
-            "--index",  index,
-            "--cpu",    TARGET_CPU_CORES,
-            "--memory", TARGET_RAM_MB,
-            "--root",   "1",
-            "--adb",    "1",
-        )
+        log.warning(f"[BASE] modify may goc loi: {result.stderr.strip()}")
+        log.warning("[BASE] Hay cau hinh may goc (index=0) thu cong trong LDPlayer truoc khi chay setup.")
 
-    # 2. Device Spoofing
+
+def configure_instance(index: int, name: str) -> None:
+    """
+    Device Spoofing cho mot instance (IMEI, Android ID, Manufacturer, Model).
+    Root/ADB/Resolution da duoc ke thua tu may goc index=0 qua copy.
+    Khong can chay modify lai de tranh bug persistence cua ldconsole.
+    """
+    log.info(f"[CONFIG] Dang cau hinh {name} (index={index})...")
+
     profile    = _random_device_profile()
     imei       = _random_imei()
     android_id = _random_android_id()
@@ -257,7 +255,7 @@ def configure_instance(index: int, name: str) -> None:
 
 
 def configure_all_instances() -> None:
-    """Cau hinh tuan tu tat ca 10 instance muc tieu."""
+    """Device Spoofing tuan tu cho tat ca 10 instance muc tieu."""
     existing = list_instances()
     for i in range(1, INSTANCE_COUNT + 1):
         name = f"{INSTANCE_PREFIX}{i:02d}"
@@ -340,10 +338,13 @@ def full_setup() -> None:
     log.info("BAT DAU: Quy trinh khoi tao TikTok Affiliate Farm")
     log.info("=" * 60)
 
-    log.info("--- BUOC 1: Tao Instance ---")
+    log.info("--- BUOC 0: Cau Hinh May Goc (Template index=0) ---")
+    configure_base_instance()
+
+    log.info("--- BUOC 1: Tao Instance (copy --from 0) ---")
     create_instances()
 
-    log.info("--- BUOC 2: Cau Hinh & Device Spoofing ---")
+    log.info("--- BUOC 2: Device Spoofing (IMEI/Model ke thua Root+ADB tu may goc) ---")
     configure_all_instances()
 
     log.info("--- BUOC 3: Query & Luu Trang Thai ---")
@@ -377,17 +378,20 @@ if __name__ == "__main__":
         print("""
 LDPlayer Manager - TikTok Shop Affiliate Farm
 Usage:
-  python ld_manager.py setup       # Full setup (create + configure + status)
-  python ld_manager.py create      # Only create instances
-  python ld_manager.py configure   # Only configure all instances
-  python ld_manager.py status      # Query & save status report
-  python ld_manager.py list        # List all existing instances
+  python ld_manager.py setup           # Full setup (base config + create + spoof + status)
+  python ld_manager.py configure-base  # Chi cau hinh may goc index=0 lam template
+  python ld_manager.py create          # Chi tao 10 instance (copy --from 0)
+  python ld_manager.py configure       # Chi chay device spoofing tren 10 may
+  python ld_manager.py status          # Query & save status report
+  python ld_manager.py list            # List all existing instances
 """)
         sys.exit(0)
 
     cmd = sys.argv[1].lower()
     if cmd == "setup":
         full_setup()
+    elif cmd == "configure-base":
+        configure_base_instance()
     elif cmd == "create":
         create_instances()
     elif cmd == "configure":
