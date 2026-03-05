@@ -4,5 +4,12 @@
     "INSTANCE_PREFIX": "TikTok_US_",
     "TARGET_RAM_MB": 3072,
     "TARGET_CPU_CORES": 2,
-    "SOCKSDROID_APK_PATH": "data\\socksdroid.apk"
+    "SOCKSDROID_APK_PATH": "data\\socksdroid.apk",
+    "TIKTOK_PACKAGE": "com.ss.android.ugc.trill",
+    "SCREEN_WIDTH": 1080,
+    "SCREEN_HEIGHT": 1920,
+    "SESSION_MIN_SEC": 900,
+    "SESSION_MAX_SEC": 1200,
+    "REST_MIN_HOURS": 2,
+    "REST_MAX_HOURS": 4
 }
