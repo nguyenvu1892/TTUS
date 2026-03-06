@@ -505,14 +505,30 @@ def configure_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict
         logger.error(_err(f"{label} Khong the ket noi ADB. VM co the chua chay hoac ADB chua bat."))
         return False
 
-    # 2. Force-stop SocksDroid truoc khi ghi file
+    # 2. Kill TOAN BO tien trinh SocksDroid (force-stop + killall)
+    #    am force-stop co the khong kill het service con. killall dam bao sach.
     _adb_shell_su(adb_exe, port, f"am force-stop {SOCKSDROID_PACKAGE}")
-    time.sleep(0.4)
+    _adb_shell_su(adb_exe, port, f"killall {SOCKSDROID_PACKAGE} 2>/dev/null; true")
+    time.sleep(0.8)  # Cho process chet hoan toan truoc khi ghi file
 
-    # 3. Tao thu muc SharedPrefs
+    # 3. Lay UID CHINH XAC cua app tu thu muc data package (do PackageManager tao voi UID dung)
+    #    TUYET DOI KHONG lay tu {SOCKSDROID_PREFS_DIR} vi dir do DO CHINH TA tao bang root
+    #    -> dung UID: /data/data/<pkg>  (luon duoc system giu dung)
+    ok_uid, app_uid_str = _adb_shell_su(adb_exe, port,
+                                         f"stat -c %u /data/data/{SOCKSDROID_PACKAGE}")
+    if not ok_uid or not app_uid_str.strip().isdigit():
+        logger.error(_err(f"{label} Khong lay duoc UID cua {SOCKSDROID_PACKAGE}: '{app_uid_str}'. "
+                          "SocksDroid chua duoc cai?"))
+        return False
+    app_uid = app_uid_str.strip()
+    logger.info(_info(f"{label} App UID = {app_uid}"))
+
+    # 4. Tao thu muc SharedPrefs va FIX OWNER NGAY (chu so huu dung cua app, khong phai root)
     _adb_shell_su(adb_exe, port, f"mkdir -p {SOCKSDROID_PREFS_DIR}")
+    _adb_shell_su(adb_exe, port, f"chown {app_uid}:{app_uid} {SOCKSDROID_PREFS_DIR}")
+    _adb_shell_su(adb_exe, port, f"chmod 771 {SOCKSDROID_PREFS_DIR}")
 
-    # 4. Ghi XML SharedPrefs dung base64 -- tranh 100% van de escape ky tu dac biet
+    # 5. Ghi XML SharedPrefs dung base64 -- toan bo ky tu dac biet duoc ma hoa an toan
     xml_content = (
         "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>"
         "<map>"
@@ -531,21 +547,27 @@ def configure_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict
     ok_write, out_write = _adb_shell_su(adb_exe, port, write_cmd, timeout=15)
     if not ok_write:
         logger.error(_err(f"{label} Ghi SharedPrefs that bai: {out_write[:120]}"))
-        logger.error(_err(f"{label} Kiem tra: 1) Root bat chua? 2) port {port} dung chua?"))
+        logger.error(_err(f"{label} Kiem tra: Root bat? Port {port} dung? ADB connect OK?"))
         return False
 
-    # 5. Set quyen file va owner
+    # 6. Fix quyen file: 660 (rw-rw----) + owner = app UID (khong phai root)
+    _adb_shell_su(adb_exe, port, f"chown {app_uid}:{app_uid} {SOCKSDROID_PREFS_FILE}")
     _adb_shell_su(adb_exe, port, f"chmod 660 {SOCKSDROID_PREFS_FILE}")
-    _adb_shell_su(adb_exe, port,
-                  f"chown $(stat -c '%u:%g' {SOCKSDROID_PREFS_DIR}) {SOCKSDROID_PREFS_FILE}")
 
-    # 6. Khoi dong SocksDroid
+    # 7. Xac nhan file ton tai va co dung UID chu so huu (truoc khi start app)
+    ok_ls, ls_out = _adb_shell_su(adb_exe, port, f"ls -la {SOCKSDROID_PREFS_FILE}")
+    logger.info(_info(f"{label} File prefs: {ls_out[:100]}"))
+    if app_uid not in ls_out:
+        logger.warning(_warn(f"{label} CANH BAO: File van chua duoc chuyen sang UID={app_uid}. "
+                             f"App co the ghi de bang gia tri mac dinh!"))
+
+    # 8. Khoi dong SocksDroid - doc SharedPrefs ngay khi start (truoc khi load UI)
     ok_start, _ = _adb_shell_su(adb_exe, port,
-                                 f"am start -n {SOCKSDROID_ACTIVITY} --ez intent_start true")
+                                 f"am start -n {SOCKSDROID_ACTIVITY}")
     if ok_start:
-        logger.info(_ok(f"{label} Cau hinh proxy va khoi dong SocksDroid thanh cong."))
+        logger.info(_ok(f"{label} SocksDroid da khoi dong. Proxy se duoc tai tu SharedPrefs."))
     else:
-        logger.warning(_warn(f"{label} Ghi SharedPrefs OK nhung am start that bai."))
+        logger.warning(_warn(f"{label} am start that bai - mo thu cong trong VM."))
 
     return True
 
