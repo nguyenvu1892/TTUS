@@ -272,13 +272,19 @@ def configure_all_instances() -> None:
 
 # Cac tham so toi uu cho moi truong Farm (TikTok + SocksDroid)
 _OPTIMIZE_SETTINGS = {
+    # --- Hieu nang (toi thieu cho Farm) ---
     "advancedSettings.cpuCount"     : 2,       # 2 core du chay SocksDroid+TikTok
     "advancedSettings.memorySize"   : 1536,    # 1536MB: toi thieu tranh OOM kill
-    "advancedSettings.resolution"   : {"width": 720, "height": 1280},  # Giu nguyen toa do ADB
+    "advancedSettings.resolution"   : {"width": 720, "height": 1280},
     "advancedSettings.resolutionDpi": 240,     # DPI nhe hon (320 -> 240)
-    "basicSettings.fps"             : 20,      # 20fps: du mua man hinh, tiet kiem CPU
-    "advancedSettings.micphoneName" : "",      # Tat mic (chuoi rong = disable)
+    "basicSettings.fps"             : 20,      # 20fps tiet kiem CPU
+    "advancedSettings.micphoneName" : "",      # Tat mic
     "advancedSettings.speakerName"  : "",      # Tat speaker
+    # --- Moi truong US (Language / GPS) ---
+    "basicSettings.rootMode"        : True,    # Bao dam Root ON sau moi clone
+    "basicSettings.language"        : "en_US", # Ep ngon ngu Tieng Anh My
+    "basicSettings.lat"             : 40.730610,   # GPS New York City -- vi do
+    "basicSettings.lng"             : -73.935242,  # GPS New York City -- kinh do
 }
 
 
@@ -383,152 +389,6 @@ def optimize_all_vms() -> dict:
     )
     return results
 
-
-# ===========================================================================
-# US ENVIRONMENT SPOOFING -- Gia mao Ngon ngu / Mui gio / GPS sang My
-# ===========================================================================
-
-_ADB_BOOT_TIMEOUT  = 90   # Cho Android boot (giay)
-_ADB_BOOT_POLL     = 3    # Tan suat check (giay)
-
-# Toa do New York City (co the thay bang bat ky thanh pho My nao)
-_US_GPS_LAT = "40.730610"
-_US_GPS_LNG = "-73.935242"
-
-
-def _adb_exe_path() -> str:
-    """Tra ve duong dan adb.exe dua vao LDPLAYER_PATH trong config."""
-    return str(Path(CFG["LDPLAYER_PATH"]) / "adb.exe")
-
-
-def _vm_adb_port(ldplayer_index: int) -> int:
-    return 5555 + (ldplayer_index * 2)
-
-
-def _run_adb(adb_exe: str, port: int, *cmd_args, timeout: int = 30) -> tuple:
-    """Goi adb -s 127.0.0.1:<port> <cmd_args>. Returns (ok, output)."""
-    serial = f"127.0.0.1:{port}"
-    try:
-        r = subprocess.run(
-            [adb_exe, "-s", serial] + list(cmd_args),
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
-        )
-        return r.returncode == 0, (r.stdout + r.stderr).strip()
-    except Exception as exc:
-        return False, str(exc)
-
-
-def _wait_boot_ld(adb_exe: str, index: int, name: str) -> bool:
-    port    = _vm_adb_port(index)
-    deadline = time.time() + _ADB_BOOT_TIMEOUT
-    while time.time() < deadline:
-        _run_adb(adb_exe, port, "connect", f"127.0.0.1:{port}", timeout=8)
-        ok, out = _run_adb(adb_exe, port, "shell", "getprop sys.boot_completed", timeout=8)
-        if ok and out.strip() == "1":
-            log.info(f"[ENV] [{name}] Android da san sang.")
-            return True
-        time.sleep(_ADB_BOOT_POLL)
-    log.error(f"[ENV] [{name}] TIMEOUT: Android chua boot sau {_ADB_BOOT_TIMEOUT}s.")
-    return False
-
-
-def set_us_environment(vm_indices: list = None) -> dict:
-    """
-    Gia mao moi truong he thong sang chuan My (1 lan duy tri vinh vien).
-
-    Luong:
-      1. Launch VM chua chay
-      2. Cho Android boot xong (getprop sys.boot_completed == '1')
-      3. Ap dung: Ngon ngu (en-US), Mui gio (America/New_York)
-      4. Ap dung: GPS (New York City via ldconsole location)
-      5. adb reboot -- khoi dong lai de persist.sys.* ngam vinh vien
-
-    Args:
-      vm_indices: List index can xu ly. Mac dinh: lay tu list2 (bo index 0).
-
-    Returns:
-      dict {vm_name: 'ok' | 'boot_fail' | 'error'}
-    """
-    adb_exe    = _adb_exe_path()
-    existing   = list_instances()   # {name: index}
-    results    = {}
-
-    # Chon VM target
-    if vm_indices is None:
-        targets = [(name, idx) for name, idx in existing.items() if idx != 0]
-    else:
-        targets = [(name, idx) for name, idx in existing.items()
-                   if idx in vm_indices and idx != 0]
-
-    log.info("=" * 60)
-    log.info(f"[ENV] BAT DAU: Spoof US environment cho {len(targets)} VM")
-    log.info(f"[ENV] GPS: ({_US_GPS_LAT}, {_US_GPS_LNG}) -- New York City")
-    log.info("=" * 60)
-
-    for name, idx in sorted(targets, key=lambda x: x[1]):
-        port  = _vm_adb_port(idx)
-        label = f"[ENV] [{name}] [idx={idx}] [port={port}]"
-
-        # -- Buoc 1: Launch VM neu chua chay --
-        status = get_instance_status(idx)
-        if status != "running":
-            log.info(f"{label} Dang launch VM...")
-            r = ld_command("launch", "--index", str(idx), timeout=30)
-            if r.returncode != 0:
-                log.error(f"{label} Launch that bai. Bo qua.")
-                results[name] = "error"
-                continue
-            time.sleep(2)
-
-        # -- Buoc 2: Cho Android boot --
-        if not _wait_boot_ld(adb_exe, idx, name):
-            results[name] = "boot_fail"
-            continue
-
-        # -- Buoc 3: Ap dung Language + Timezone qua su -c setprop --
-        env_cmd = (
-            "su -c \""
-            "setprop persist.sys.locale en-US && "
-            "setprop persist.sys.timezone America/New_York && "
-            "service call alarm 3 s16 America/New_York && "
-            "am broadcast -a android.intent.action.LOCALE_CHANGED"
-            "\""
-        )
-        ok, out = _run_adb(adb_exe, port, "shell", env_cmd, timeout=20)
-        if ok:
-            log.info(f"{label} Language=en-US, Timezone=America/New_York: OK")
-        else:
-            log.warning(f"{label} setprop warning (co the khong co root): {out[:80]}")
-
-        # -- Buoc 4: GPS Spoofing qua ldconsole location --
-        gps_ok = ld_command(
-            "location", "--index", str(idx),
-            "--LNG", _US_GPS_LNG, "--LAT", _US_GPS_LAT,
-            timeout=15,
-        )
-        if gps_ok.returncode == 0:
-            log.info(f"{label} GPS New York City ({_US_GPS_LAT}, {_US_GPS_LNG}): OK")
-        else:
-            log.warning(f"{label} GPS via ldconsole that bai -- thu setprop...")
-            # Fallback: setprop GPS (chi co tac dung tren mot so ROM)
-            _run_adb(adb_exe, port, "shell",
-                     f"su -c \"setprop persist.gps.latitude {_US_GPS_LAT} "
-                     f"&& setprop persist.gps.longitude {_US_GPS_LNG}\"",
-                     timeout=10)
-
-        # -- Buoc 5: adb reboot de persist settings vinh vien --
-        log.info(f"{label} Dang reboot VM de ngam cau hinh moi vinh vien...")
-        _run_adb(adb_exe, port, "reboot", timeout=15)
-        log.info(f"{label} Da gui lenh reboot. VM se khoi dong lai.")
-        results[name] = "ok"
-        time.sleep(1.0)   # Tranh gua qua nhieu lenh cung luc
-
-    ok_count  = sum(1 for v in results.values() if v == "ok")
-    fail_count = len(results) - ok_count
-    log.info(f"[ENV] HOAN TAT: {ok_count} OK / {fail_count} loi / {len(results)} tong")
-    log.info("[ENV] Luu y: Sau khi VM reboot xong, ung dung moi se thay ngon ngu/mui gio My.")
-    return results
 
 
 # ===========================================================================
@@ -649,8 +509,8 @@ Usage:
   python ld_manager.py setup           # Full setup (base config + create + optimize + spoof + status)
   python ld_manager.py configure-base  # Chi cau hinh may goc index=0 lam template
   python ld_manager.py create          # Chi tao 10 instance (copy --from 0)
-  python ld_manager.py optimize        # Ep cau hinh toi thieu (CPU/RAM/FPS/Audio) -- VM phai tat
-  python ld_manager.py spoof_env       # Gia mao Language/Timezone/GPS sang My (1 lan), reboot VM
+  python ld_manager.py optimize        # Ep cau hinh toi thieu + Language en_US + GPS New York (VM phai tat)
+  python ld_manager.py spoof_env       # Biet danh cho 'optimize' (chay lai US env rieng)
   python ld_manager.py configure       # Chi chay device spoofing tren 10 may
   python ld_manager.py status          # Query & save status report
   python ld_manager.py list            # List all existing instances
@@ -667,9 +527,11 @@ Usage:
     elif cmd == "optimize":
         optimize_all_vms()
     elif cmd == "spoof_env":
-        results = set_us_environment()
-        for name, status in results.items():
-            print(f"  {name}: {status}")
+        # spoof_env = goi optimize_all_vms (Language/GPS gio duoc goi trong JSON config)
+        log.info("[spoof_env] Re-applying US environment via JSON config (VM phai TAT)...")
+        results = optimize_all_vms()
+        for name, st in results.items():
+            print(f"  {name}: {st}")
     elif cmd == "configure":
         configure_all_instances()
     elif cmd == "status":
