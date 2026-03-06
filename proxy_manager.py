@@ -670,28 +670,49 @@ def configure_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict
             device.swipe(360, 900, 360, 300, duration=0.4)
             time.sleep(0.5)
 
-        # 4c. Kich hoat toggle "Username & Password Authentication" neu dang OFF
-        auth_toggle = device(text=AUTH_SECTION)
-        if auth_toggle.exists:
-            # Tim Switch / CheckBox ke ben hang nay
-            # uiautomator2: lay parent row roi tim widget con
-            auth_row = device(text=AUTH_SECTION)
-            # Tim Switch trong cung container voi text nay
-            auth_sw = device(className="android.widget.CheckBox", checked=False)
-            if not auth_sw.exists:
-                auth_sw = device(className="android.widget.Switch", checked=False)
-            # Neu tim duoc switch dang OFF -> click
-            if auth_sw.exists:
-                logger.info(f"{label} Bat 'Username & Password Authentication'...")
-                auth_sw.click()
-                time.sleep(0.5)
+        # 4c. Kich hoat "Username & Password Authentication" neu chua tick
+        #    CheckBoxPreference: ban than hang preference la checkable element.
+        #    Kiem tra .info['checked'] tren chinh hang do, KHONG tim checkbox con bat ky.
+        auth_row = device(text=AUTH_SECTION)
+        if auth_row.exists:
+            auth_info = auth_row.info
+            is_checked = auth_info.get("checked", None)
+
+            if is_checked is False:
+                # Chua duoc tick -> click DE BAT
+                logger.info(f"{label} [AUTH] 'Username & Password Authentication' dang OFF. Bat len...")
+                auth_row.click()
+                time.sleep(0.6)   # Cho UI mo khoa 2 o Username/Password ben duoi
+                # Xac nhan lai da bat chua
+                new_checked = device(text=AUTH_SECTION).info.get("checked", None)
+                if new_checked is False:
+                    logger.error(_err(f"{label} [AUTH] Van khong the bat Authentication. "
+                                      "VM se KHONG duoc bat VPN."))
+                    return False
+                logger.info(_ok(f"{label} [AUTH] Da bat thanh cong -- Username/Password fields da mo."))
+
+            elif is_checked is True:
+                logger.info(f"{label} [AUTH] 'Username & Password Authentication' da ON, bo qua.")
+
             else:
-                # Co the da ON hoac la dang dung ToggleButton
-                logger.info(f"{label} 'Username & Password Authentication' co ve da ON.")
+                # 'checked' key khong co trong info (co the la Switch hoac view khac)
+                # Fallback: tim con truc tiep la CheckBox trong cung container
+                auth_cb = auth_row.child(className="android.widget.CheckBox")
+                if auth_cb.exists:
+                    if not auth_cb.info.get("checked", True):
+                        logger.info(f"{label} [AUTH] Tim thay CheckBox con dang OFF. Bat len...")
+                        auth_cb.click()
+                        time.sleep(0.6)
+                else:
+                    # Khong xac dinh duoc trang thai -- click row de dam bao bat
+                    logger.warning(_warn(f"{label} [AUTH] Khong xac dinh duoc 'checked' state. "
+                                         "Click de dam bao bat..."))
+                    auth_row.click()
+                    time.sleep(0.6)
         else:
-            # Section nay co the co ten khac hoac khong ton tai -> tiep tuc cu gan
-            logger.warning(_warn(f"{label} Khong tim thay muc '{AUTH_SECTION}' -- "
-                                 "Username/Password van duoc dien (co the tu dong hien thi)."))
+            logger.warning(_warn(f"{label} Khong tim thay muc '{AUTH_SECTION}' tren man hinh. "
+                                  "Thu dien Username/Password truc tiep..."))
+
 
         # 4d. PHASE 2: Dien Username va Password (gio da scroll xuong va auth da bat)
         logger.info(f"{label} [4/5] Phase 2 - Dien Username, Password...")
