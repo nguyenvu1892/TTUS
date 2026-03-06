@@ -27,8 +27,9 @@ import sys
 def _bootstrap_deps():
     """Kiem tra va tu dong cai dat cac thu vien can thiet qua pip."""
     required = {
-        "requests": "requests>=2.28.0",
-        "colorama": "colorama>=0.4.6",
+        "requests":     "requests>=2.28.0",
+        "colorama":     "colorama>=0.4.6",
+        "uiautomator2": "uiautomator2>=3.0.0",
     }
     missing = []
     for module_name, pip_spec in required.items():
@@ -59,9 +60,11 @@ import json
 import logging
 import os
 import time
+import xml.etree.ElementTree as ET
 
 import colorama
 import requests
+import uiautomator2 as u2
 from colorama import Fore, Style
 
 colorama.init(autoreset=True)
@@ -483,93 +486,165 @@ def install_app(ld_console: str, index_0: int, apk_path: str) -> bool:
     return ok
 
 
+# ============================================================
+# UI Automator Helpers
+# ============================================================
+
+def _u2_connect(serial: str, label: str):
+    """
+    Ket noi uiautomator2 den may ao.
+    uiautomator2 tu dong cai atx-agent vao device qua ADB neu chua co.
+    Khong can internet tren device -- agent duoc copy tu host machine.
+    """
+    try:
+        device = u2.connect(serial)
+        # Ping kiem tra ket noi
+        device.info
+        return device
+    except Exception as exc:
+        raise RuntimeError(f"{label} u2.connect({serial}) that bai: {exc}")
+
+
+def _u2_find_edittexts(device) -> list:
+    """
+    Tim tat ca EditText tren man hinh SocksDroid.
+    Tra ve list element theo thu tu xuat hien (top-to-bottom).
+    """
+    return device(className="android.widget.EditText").get()
+
+
+def _u2_find_switch(device):
+    """Tim Switch/ToggleButton chinh cua SocksDroid."""
+    # Thu theo class Switch
+    sw = device(className="android.widget.Switch")
+    if sw.exists:
+        return sw
+    # Thu theo ToggleButton
+    tb = device(className="android.widget.ToggleButton")
+    if tb.exists:
+        return tb
+    return None
+
+
+def _u2_clear_and_type(device, element, text: str, label: str) -> bool:
+    """Tap vao truong, xoa het, go text moi."""
+    try:
+        element.click()
+        time.sleep(0.3)
+        # Chon tat ca bang CTRL+A
+        device.press("ctrl", "a")
+        time.sleep(0.1)
+        device.press("delete")
+        time.sleep(0.1)
+        # Ou dung clear_text() de dam bao sach
+        element.clear_text()
+        time.sleep(0.2)
+        element.set_text(str(text))
+        time.sleep(0.3)
+        # Dismiss keyboard
+        device.press("back")
+        time.sleep(0.2)
+        return True
+    except Exception as exc:
+        logger.warning(_warn(f"{label} Khong the dien truong: {exc}"))
+        return False
+
+
+# ============================================================
+# Configure via UI Automator
+# ============================================================
+
 def configure_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict) -> bool:
     """
-    Ghi cau hinh SOCKS5 proxy vao SharedPreferences cua SocksDroid bang Direct ADB Root.
+    Cau hinh SOCKS5 proxy bang UI Automator (uiautomator2) -- 100% UI interaction.
 
-    Args:
-        ldplayer_index: Index CHINH XAC tu ldconsole (0-based), dung de tinh port.
-        vm_name:        Ten may ao (de log).
-        proxy:          dict {ip, port, user, pass}
+    Quy trinh (giao dien nguoi dung thuc):
+      1. Stop SocksDroid
+      2. Start SocksDroid (man hinh chinh hien EditText fields)
+      3. Tat VPN neu dang bat (tranh loi mang khi doi IP)
+      4. Dien lan luot vao: Server, Port, Username, Password
+      5. Bat lai cong tac VPN
 
-    Port = 5555 + (ldplayer_index * 2)
+    Ly do khong dung XML injection:
+      Android SharedPreferences cached trong RAM; file ghi bang root bi overwrite
+      khi app khoi dong do sai owner (root vs app UID). UI input la duy nhat guaranteed.
     """
     port   = _adb_port(ldplayer_index)
     serial = f"127.0.0.1:{port}"
     label  = f"[{vm_name}] [idx={ldplayer_index}] [{serial}]"
 
-    logger.info(f"{label} Dang cau hinh proxy -> {proxy['ip']}:{proxy['port']} ...")
+    logger.info(f"{label} Cau hinh proxy qua UI Automator: {proxy['ip']}:{proxy['port']}...")
 
-    # 1. Ket noi ADB
     if not _adb_connect(adb_exe, port):
-        logger.error(_err(f"{label} Khong the ket noi ADB. VM co the chua chay hoac ADB chua bat."))
+        logger.error(_err(f"{label} Khong the ket noi ADB."))
         return False
 
-    # 2. Kill TOAN BO tien trinh SocksDroid (force-stop + killall)
-    #    am force-stop co the khong kill het service con. killall dam bao sach.
-    _adb_shell_su(adb_exe, port, f"am force-stop {SOCKSDROID_PACKAGE}")
-    _adb_shell_su(adb_exe, port, f"killall {SOCKSDROID_PACKAGE} 2>/dev/null; true")
-    time.sleep(0.8)  # Cho process chet hoan toan truoc khi ghi file
-
-    # 3. Lay UID CHINH XAC cua app tu thu muc data package (do PackageManager tao voi UID dung)
-    #    TUYET DOI KHONG lay tu {SOCKSDROID_PREFS_DIR} vi dir do DO CHINH TA tao bang root
-    #    -> dung UID: /data/data/<pkg>  (luon duoc system giu dung)
-    ok_uid, app_uid_str = _adb_shell_su(adb_exe, port,
-                                         f"stat -c %u /data/data/{SOCKSDROID_PACKAGE}")
-    if not ok_uid or not app_uid_str.strip().isdigit():
-        logger.error(_err(f"{label} Khong lay duoc UID cua {SOCKSDROID_PACKAGE}: '{app_uid_str}'. "
-                          "SocksDroid chua duoc cai?"))
-        return False
-    app_uid = app_uid_str.strip()
-    logger.info(_info(f"{label} App UID = {app_uid}"))
-
-    # 4. Tao thu muc SharedPrefs va FIX OWNER NGAY (chu so huu dung cua app, khong phai root)
-    _adb_shell_su(adb_exe, port, f"mkdir -p {SOCKSDROID_PREFS_DIR}")
-    _adb_shell_su(adb_exe, port, f"chown {app_uid}:{app_uid} {SOCKSDROID_PREFS_DIR}")
-    _adb_shell_su(adb_exe, port, f"chmod 771 {SOCKSDROID_PREFS_DIR}")
-
-    # 5. Ghi XML SharedPrefs dung base64 -- toan bo ky tu dac biet duoc ma hoa an toan
-    xml_content = (
-        "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>"
-        "<map>"
-        f"<string name='proxy_server'>{proxy['ip']}</string>"
-        f"<string name='proxy_port'>{proxy['port']}</string>"
-        f"<string name='proxy_username'>{proxy['user']}</string>"
-        f"<string name='proxy_password'>{proxy['pass']}</string>"
-        "<boolean name='ipv6' value='false' />"
-        "<boolean name='udp_forward' value='false' />"
-        "<boolean name='per_app' value='false' />"
-        "</map>"
-    )
-    b64_xml   = base64.b64encode(xml_content.encode("utf-8")).decode("ascii")
-    write_cmd = f"echo {b64_xml} | base64 -d > {SOCKSDROID_PREFS_FILE}"
-
-    ok_write, out_write = _adb_shell_su(adb_exe, port, write_cmd, timeout=15)
-    if not ok_write:
-        logger.error(_err(f"{label} Ghi SharedPrefs that bai: {out_write[:120]}"))
-        logger.error(_err(f"{label} Kiem tra: Root bat? Port {port} dung? ADB connect OK?"))
+    try:
+        # Ket noi uiautomator2 (tu dong cai atx-agent neu can)
+        device = _u2_connect(serial, label)
+    except RuntimeError as exc:
+        logger.error(_err(str(exc)))
         return False
 
-    # 6. Fix quyen file: 660 (rw-rw----) + owner = app UID (khong phai root)
-    _adb_shell_su(adb_exe, port, f"chown {app_uid}:{app_uid} {SOCKSDROID_PREFS_FILE}")
-    _adb_shell_su(adb_exe, port, f"chmod 660 {SOCKSDROID_PREFS_FILE}")
+    try:
+        # 1. Stop SocksDroid hoan toan
+        device.app_stop(SOCKSDROID_PACKAGE)
+        time.sleep(0.8)
 
-    # 7. Xac nhan file ton tai va co dung UID chu so huu (truoc khi start app)
-    ok_ls, ls_out = _adb_shell_su(adb_exe, port, f"ls -la {SOCKSDROID_PREFS_FILE}")
-    logger.info(_info(f"{label} File prefs: {ls_out[:100]}"))
-    if app_uid not in ls_out:
-        logger.warning(_warn(f"{label} CANH BAO: File van chua duoc chuyen sang UID={app_uid}. "
-                             f"App co the ghi de bang gia tri mac dinh!"))
+        # 2. Mo SocksDroid tuoi
+        device.app_start(SOCKSDROID_PACKAGE, ".MainActivity", wait=True)
+        time.sleep(2.5)  # Cho UI load day du
 
-    # 8. Khoi dong SocksDroid - doc SharedPrefs ngay khi start (truoc khi load UI)
-    ok_start, _ = _adb_shell_su(adb_exe, port,
-                                 f"am start -n {SOCKSDROID_ACTIVITY}")
-    if ok_start:
-        logger.info(_ok(f"{label} SocksDroid da khoi dong. Proxy se duoc tai tu SharedPrefs."))
-    else:
-        logger.warning(_warn(f"{label} am start that bai - mo thu cong trong VM."))
+        # 3. Tat VPN neu dang bat (tranh loi mang trong luc doi IP)
+        vpn_switch = _u2_find_switch(device)
+        if vpn_switch and vpn_switch.info.get("checked", False):
+            logger.info(f"{label} VPN dang ON -- tat truoc khi doi IP...")
+            vpn_switch.click()
+            time.sleep(1.5)
 
-    return True
+        # 4. Tim tat ca EditText fields va dien tham so proxy
+        #    SocksDroid MainActivity layout: [0]=Server [1]=Port [2]=Username [3]=Password
+        field_values = [
+            ("Server",   proxy["ip"]),
+            ("Port",     str(proxy["port"])),
+            ("Username", proxy["user"]),
+            ("Password", proxy["pass"]),
+        ]
+
+        for field_idx, (field_name, value) in enumerate(field_values):
+            # tim theo instance index
+            el = device(className="android.widget.EditText", instance=field_idx)
+
+            # Neu khong tim thay theo instance, thu theo resourceId pattern
+            if not el.exists:
+                logger.warning(_warn(f"{label} Khong tim thay truong '{field_name}' (instance={field_idx})"))
+                continue
+
+            ok = _u2_clear_and_type(device, el, value, label)
+            if ok:
+                logger.info(_info(f"{label} [{field_name}] = {value if field_name != 'Password' else '****'}"))
+            else:
+                logger.warning(_warn(f"{label} Loi khi dien truong {field_name}"))
+
+        # 5. Bat cong tac VPN voi cau hinh moi
+        time.sleep(0.5)
+        vpn_switch = _u2_find_switch(device)
+        if vpn_switch:
+            if not vpn_switch.info.get("checked", False):
+                vpn_switch.click()
+                time.sleep(2.0)  # Cho VPN connect
+                logger.info(_ok(f"{label} Da bat VPN voi proxy moi: {proxy['ip']}:{proxy['port']}"))
+            else:
+                logger.info(_info(f"{label} VPN da ON (co the tu bat sau khi set text)."))
+        else:
+            logger.warning(_warn(f"{label} Khong tim thay VPN switch. Kiem tra thu cong."))
+
+        logger.info(_ok(f"{label} UI Automator hoan tat."))
+        return True
+
+    except Exception as exc:
+        logger.error(_err(f"{label} Loi UI Automator: {exc}"))
+        return False
 
 
 def verify_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict) -> bool:
