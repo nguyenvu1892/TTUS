@@ -512,16 +512,31 @@ def _wait_boot(adb_exe: str, vm: dict, timeout: int = BOOT_TIMEOUT_SEC) -> bool:
     return False
 
 
+
+BATCH_SIZE    = 3    # So VM khoi dong moi cuot (Chunk)
+BATCH_GAP_SEC = 5    # Nghi giua cac Batch (giay)
+
+
 def auto_wake_all(cfg: dict, start_index: int = 1, end_index: int = 10) -> list:
     """
-    Buoc 1: Bat cac VM trong pham vi [start_index, end_index], cho Android boot xong.
+    Buoc 1: Bat cac VM trong pham vi [start_index, end_index] theo phuong phap
+    'cuon chieu' (Chunking) de tranh Boot Storm (qua tai Disk/CPU).
 
-    Luu y:
-      - Index 0 (may goc / LDPlayer template) bi loai tru tuyet doi.
-      - Chi bat VM co index nam trong [start_index, end_index].
+    Thuat toan:
+      1. Chia danh sach VM thanh cac Batch kich thuoc BATCH_SIZE
+      2. Moi Batch:
+         a. Launch tung VM (delay 2s/VM trong cung Batch)
+         b. DOI toan bo Batch boot xong (song song, timeout BOOT_TIMEOUT_SEC)
+         c. Chi khi Batch hien tai FULLY BOOT -> nghi BATCH_GAP_SEC -> Batch tiep
+      3. VM da chay san -> them ngay vao ready_vms, khong launch lai
+      4. VM boot that bai -> log ERROR, bo qua (tuyet doi khong dua vao Farm)
+
+    Bao ve:
+      - Index 0 (may goc) bi loai tru tuyet doi
+      - Chi bat VM co index nam trong [start_index, end_index]
 
     Returns:
-      list VM da san sang [{index, name}] -- chi VM boot thanh cong.
+      list VM [{index, name}] da boot xong thanh cong, sap xep theo index.
     """
     ld_console = cfg["_LD_CONSOLE"]
     adb_exe    = cfg["_ADB_EXE"]
@@ -544,43 +559,78 @@ def auto_wake_all(cfg: dict, start_index: int = 1, end_index: int = 10) -> list:
         )
         return []
 
+    # Chia thanh batch
+    batches = [target_vms[i:i + BATCH_SIZE] for i in range(0, len(target_vms), BATCH_SIZE)]
+    total_batches = len(batches)
+
     logger.info("=" * 64)
-    logger.info(f"  BUOC 1: AUTO-WAKE -- {len(target_vms)} VM (index {start_index}~{end_index})")
+    logger.info(
+        f"  BUOC 1: AUTO-WAKE -- {len(target_vms)} VM | "
+        f"BATCH_SIZE={BATCH_SIZE} | {total_batches} cuot | "
+        f"index {start_index}~{end_index}"
+    )
     logger.info("=" * 64)
 
-    # Launch VM chua chay
-    launched = []
-    for vm in target_vms:
-        if _ld_is_running(ld_console, vm["index"]):
-            logger.info(f"[{vm['name']}] Da chay san sang.")
-            launched.append(vm)
-        else:
-            logger.info(f"[{vm['name']}] Chua chay -- dang launch...")
-            if _launch_vm(ld_console, vm):
-                launched.append(vm)
-                time.sleep(1.5)
-
-    if not launched:
-        logger.error("Khong launch duoc VM nao.")
-        return []
-
-    # Cho tat ca VM boot xong (song song)
-    logger.info(f"Cho {len(launched)} VM boot xong (timeout {BOOT_TIMEOUT_SEC}s/VM)...")
     ready_vms = []
 
-    with ThreadPoolExecutor(max_workers=min(4, len(launched))) as pool:
-        futures = {pool.submit(_wait_boot, adb_exe, vm): vm for vm in launched}
-        for future in as_completed(futures):
-            vm = futures[future]
-            try:
-                if future.result():
-                    ready_vms.append(vm)
-            except Exception as exc:
-                logger.error(f"[{vm['name']}] Exception khi cho boot: {exc}")
+    for batch_no, batch in enumerate(batches, start=1):
+        logger.info(
+            f"  [BATCH {batch_no}/{total_batches}] "
+            f"Bat dau: {[v['name'] for v in batch]}"
+        )
+
+        # -- a. Launch cac VM chua chay trong Batch nay --
+        to_boot = []
+        for vm in batch:
+            if _ld_is_running(ld_console, vm["index"]):
+                logger.info(f"  [{vm['name']}] Da chay san sang -- khong can launch.")
+                to_boot.append(vm)   # Van can cho boot confirm
+            else:
+                logger.info(f"  [{vm['name']}] Dang launch...")
+                if _launch_vm(ld_console, vm):
+                    to_boot.append(vm)
+                else:
+                    logger.error(f"  [{vm['name']}] Launch that bai -- bo qua VM nay.")
+                time.sleep(2)   # Nghi 2s giua cac launch trong cung Batch
+
+        if not to_boot:
+            logger.warning(f"  [BATCH {batch_no}] Khong launch duoc VM nao, chuyen Batch tiep theo.")
+            continue
+
+        # -- b. DOI TOAN BO BATCH boot xong (song song) --
+        logger.info(
+            f"  [BATCH {batch_no}] Cho {len(to_boot)} VM boot xong "
+            f"(timeout {BOOT_TIMEOUT_SEC}s/VM)..."
+        )
+        batch_ready = []
+        with ThreadPoolExecutor(max_workers=len(to_boot)) as pool:
+            futures = {pool.submit(_wait_boot, adb_exe, vm): vm for vm in to_boot}
+            for future in as_completed(futures):
+                vm = futures[future]
+                try:
+                    if future.result():
+                        batch_ready.append(vm)
+                    else:
+                        logger.error(f"  [{vm['name']}] Boot TIMEOUT -- loai khoi Farm.")
+                except Exception as exc:
+                    logger.error(f"  [{vm['name']}] Exception khi cho boot: {exc}")
+
+        logger.info(
+            f"  [BATCH {batch_no}] XONG: {len(batch_ready)}/{len(to_boot)} VM ready."
+        )
+        ready_vms.extend(batch_ready)
+
+        # -- c. Nghi giua cac Batch (tru Batch cuoi cung) --
+        if batch_no < total_batches:
+            logger.info(
+                f"  [BATCH {batch_no}] Nghi {BATCH_GAP_SEC}s truoc khi launch Batch tiep theo..."
+            )
+            time.sleep(BATCH_GAP_SEC)
 
     ready_vms.sort(key=lambda v: v["index"])
-    logger.info(f"AUTO-WAKE XONG: {len(ready_vms)}/{len(launched)} VM san sang.")
+    logger.info(f"AUTO-WAKE XONG: {len(ready_vms)}/{len(target_vms)} VM san sang.")
     return ready_vms
+
 
 
 # ---------------------------------------------------------------------------
