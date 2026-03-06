@@ -376,7 +376,20 @@ def handle_onboarding(adb_exe: str, port: int, index: int) -> None:
                 pass
 
         if not found:
-            logger.info(f"[VM {index:02d}] [ONBOARDING] Khong thay '{keyword}' -- bo qua.")
+            # Probe 3 (chi cho 'Agree'): Coordinate fallback -- click vi tri co dinh
+            # Vi tri nut 'Agree and continue' luon khoanh giua, phan duoi man hinh
+            if "agree" in keyword.lower():
+                try:
+                    logger.info(
+                        f"[VM {index:02d}] [ONBOARDING] Fallback coord click "
+                        f"(0.5, 0.75) cho '{keyword}'..."
+                    )
+                    d.click(0.5, 0.75)   # toa do ty le dua tren kich thuoc man hinh
+                    time.sleep(2.0)      # doi de xem popup co bien mat khong
+                except Exception as coord_exc:
+                    logger.info(f"[VM {index:02d}] [ONBOARDING] Coord click loi: {coord_exc}")
+            else:
+                logger.info(f"[VM {index:02d}] [ONBOARDING] Khong thay '{keyword}' -- bo qua.")
 
     # -- Swipe Up cuoi cung: xoa bo Tutorial Overlay neu co --
     try:
@@ -802,6 +815,37 @@ def run_session(vm: dict, proxy: dict, cfg: dict) -> dict:
     return result
 
 
+# Toa do New York City cho GPS injection
+_US_GPS_LLI = "-73.935242,40.730610"   # format: LNG,LAT (theo ldconsole)
+
+
+def _inject_gps_all(cfg: dict, ready_vms: list) -> None:
+    """
+    Ban toa do GPS New York cho tung VM vua boot.
+    Dung ldconsole action --name setlocate -- bat buoc TikTok lay vi tri My.
+    """
+    ld_console = cfg["_LD_CONSOLE"]
+    logger.info(f"[GPS] Ep GPS New York City cho {len(ready_vms)} VM...")
+    for vm in ready_vms:
+        idx = vm["index"]
+        try:
+            r = subprocess.run(
+                [ld_console, "action", "--name", "setlocate",
+                 "--LLI", _US_GPS_LLI, "--index", str(idx)],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=10,
+            )
+            if r.returncode == 0:
+                logger.info(f"[GPS] [{vm['name']}] New York OK ({_US_GPS_LLI})")
+            else:
+                logger.warning(
+                    f"[GPS] [{vm['name']}] setlocate warn (rc={r.returncode}): "
+                    f"{(r.stdout+r.stderr).strip()[:80]}"
+                )
+        except Exception as exc:
+            logger.warning(f"[GPS] [{vm['name']}] Exception: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Farm Orchestrator -- 3 buoc
 # ---------------------------------------------------------------------------
@@ -823,6 +867,10 @@ def farm_all(cfg: dict, proxies: list,
     if not ready_vms:
         logger.error("Khong co VM nao san sang sau Auto-Wake. Dung lai.")
         return
+
+    # BUOC 1.5: Ep GPS New York City cho tung VM vua boot (ldconsole action setlocate)
+    # Lam ngay sau wake, truoc khi mo TikTok, de TikTok thay vi tri My khi khoi dong
+    _inject_gps_all(cfg, ready_vms)
 
     # BUOC 2: Pre-flight (proxy duoc slice theo so VM thuc te, khong hard-code 10)
     #   Map tuan tu: ready_vms[0] <-> proxies[0], ready_vms[1] <-> proxies[1], ...
