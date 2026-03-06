@@ -1,20 +1,17 @@
+# -*- coding: utf-8 -*-
 """
-tiktok_farmer.py — Task 3: Giả lập hành vi lướt TikTok FYP trên 10 VM song song.
+tiktok_farmer.py -- Task 3: Gias lap hanh vi luot TikTok FYP tren nhieu VM song song.
 
-Luồng:
-    1. load_config()           — Đọc config.json (kế thừa từ ld_manager.py)
-    2. load_proxies()          — Đọc data/proxies_list.txt (kế thừa từ proxy_manager.py)
-    3. _open_tiktok(i)         — Mở TikTok bằng ADB am start
-    4. run_session(i, proxy)   — Phiên lướt 15-20 phút cho 1 VM
-       ├── _humanized_swipe()  — Vuốt với tọa độ/tốc độ ngẫu nhiên hoá
-       ├── _humanized_watch()  — Xem video 7–60 giây (phân phối thực tế)
-       └── _maybe_like()       — Like ngẫu nhiên (10–15%)
-    5. _kill_tiktok(i)         — Kill TikTok sau phiên
-    6. farm_all()              — ThreadPoolExecutor 10 VM song song
+Luong 3 buoc (da nang cap):
+    1. auto_wake_all()       -- Bat VM chua chay, cho boot xong (getprop sys.boot_completed)
+    2. preflight_check_all() -- Check IP My / bat SocksDroid neu IP sai (song song + Lock)
+    3. farm_all()            -- Chay run_session() song song CHI cho VM passed pre-flight
 
 CLI:
-    python tiktok_farmer.py start       # Chạy farm 10 VM song song
-    python tiktok_farmer.py session <n> # Chạy 1 phiên thử cho VM index n
+    python tiktok_farmer.py start       # Chay farm 10 VM song song
+    python tiktok_farmer.py session <n> # Chay 1 phien thu cho VM index n (1-based)
+    python tiktok_farmer.py wake        # Chi chay buoc 1: Auto-Wake tat ca VM
+    python tiktok_farmer.py preflight   # Chi chay buoc 2: Pre-flight check all VMs
 """
 
 import json
@@ -24,11 +21,12 @@ import os
 import random
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------------------
-# Logging — dùng chung file với ld_manager.py & proxy_manager.py
+# Logging
 # ---------------------------------------------------------------------------
 LOG_FILE = os.path.join("data", "ld_manager.log")
 os.makedirs("data", exist_ok=True)
@@ -46,17 +44,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CONFIG_FILE = "config.json"
+CONFIG_FILE  = "config.json"
 PROXIES_FILE = os.path.join("data", "proxies_list.txt")
+ADB_BASE_PORT = 5555
+
+# Endpoint luay chon khi check IP (tranh rate-limit khi nhieu VM check cung luc)
+IP_CHECK_ENDPOINTS = [
+    "https://api.myip.com",
+    "https://ipinfo.io/json",
+    "https://ip-api.com/json",
+]
+BOOT_TIMEOUT_SEC  = 90    # Thoi gian cho Android boot toi da
+BOOT_POLL_SEC     = 3     # Tan suat check getprop sys.boot_completed
+PREFLIGHT_WORKERS = 5     # So thread song song cho IP check
 
 
 # ---------------------------------------------------------------------------
-# Config & Proxy Loading (kế thừa pattern từ proxy_manager.py)
+# Config & Proxy Loading
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
     if not os.path.isfile(CONFIG_FILE):
-        logger.error(f"Không tìm thấy file cấu hình: {CONFIG_FILE}")
+        logger.error(f"Khong tim thay file cau hinh: {CONFIG_FILE}")
         sys.exit(1)
 
     with open(CONFIG_FILE, encoding="utf-8") as f:
@@ -67,21 +76,28 @@ def load_config() -> dict:
                 "SESSION_MIN_SEC", "SESSION_MAX_SEC"]
     for key in required:
         if key not in cfg:
-            logger.error(f"config.json thiếu key: '{key}'")
+            logger.error(f"config.json thieu key: '{key}'")
             sys.exit(1)
 
-    console_path = os.path.join(cfg["LDPLAYER_PATH"], "ldconsole.exe")
-    if not os.path.isfile(console_path):
-        logger.error(f"Không tìm thấy ldconsole.exe tại: {console_path}")
+    ld_path    = cfg["LDPLAYER_PATH"]
+    ld_console = os.path.join(ld_path, "ldconsole.exe")
+    adb_exe    = os.path.join(ld_path, "adb.exe")
+
+    if not os.path.isfile(ld_console):
+        logger.error(f"Khong tim thay ldconsole.exe: {ld_console}")
+        sys.exit(1)
+    if not os.path.isfile(adb_exe):
+        logger.error(f"Khong tim thay adb.exe: {adb_exe}")
         sys.exit(1)
 
-    cfg["_LD_CONSOLE"] = console_path
+    cfg["_LD_CONSOLE"] = ld_console
+    cfg["_ADB_EXE"]    = adb_exe
     return cfg
 
 
 def load_proxies(path: str = PROXIES_FILE) -> list:
     if not os.path.isfile(path):
-        logger.error(f"Không tìm thấy file proxy: {path}")
+        logger.error(f"Khong tim thay file proxy: {path}")
         sys.exit(1)
 
     proxies = []
@@ -98,16 +114,111 @@ def load_proxies(path: str = PROXIES_FILE) -> list:
                 proxies.append({"ip": ip.strip(), "port": int(port_str),
                                  "user": user.strip(), "pass": pwd.strip()})
             except ValueError:
-                logger.warning(f"Dòng {lineno}: port không hợp lệ, bỏ qua.")
+                logger.warning(f"Dong {lineno}: port khong hop le, bo qua.")
     return proxies
 
 
 # ---------------------------------------------------------------------------
-# LDConsole ADB wrapper
+# LDConsole helpers
+# ---------------------------------------------------------------------------
+
+def _ld_cmd(ld_console: str, *args, timeout: int = 60) -> tuple:
+    """Goi ldconsole. Returns (ok: bool, output: str)."""
+    try:
+        result = subprocess.run(
+            [ld_console] + list(args),
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+        )
+        return result.returncode == 0, (result.stdout + result.stderr).strip()
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _ld_get_all_vms(ld_console: str) -> list:
+    """Lay danh sach TAT CA VM tu ldconsole list2. Returns [{index, name}]."""
+    ok, out = _ld_cmd(ld_console, "list2")
+    if not ok or not out.strip():
+        return []
+    vms = []
+    for line in out.strip().splitlines():
+        parts = line.split(",")
+        if len(parts) >= 2:
+            try:
+                vms.append({"index": int(parts[0].strip()), "name": parts[1].strip()})
+            except ValueError:
+                pass
+    return sorted(vms, key=lambda v: v["index"])
+
+
+def _ld_is_running(ld_console: str, index: int) -> bool:
+    ok, out = _ld_cmd(ld_console, "isrunning", "--index", str(index))
+    return ok and "running" in out.lower()
+
+
+def _ld_get_running(ld_console: str) -> list:
+    """Lay danh sach VM dang chay. Returns [{index, name}]."""
+    ok, out = _ld_cmd(ld_console, "runninglist")
+    if ok and out.strip():
+        vms = []
+        for line in out.strip().splitlines():
+            parts = line.split(",")
+            if len(parts) >= 2:
+                try:
+                    vms.append({"index": int(parts[0].strip()), "name": parts[1].strip()})
+                except ValueError:
+                    pass
+        if vms:
+            return sorted(vms, key=lambda v: v["index"])
+    # Fallback: list2 + isrunning
+    all_vms = _ld_get_all_vms(ld_console)
+    return [vm for vm in all_vms if _ld_is_running(ld_console, vm["index"])]
+
+
+# ---------------------------------------------------------------------------
+# Direct ADB helpers (khong qua ldconsole bridge)
+# ---------------------------------------------------------------------------
+
+def _adb_port(ldplayer_index: int) -> int:
+    return ADB_BASE_PORT + (ldplayer_index * 2)
+
+
+def _adb_connect(adb_exe: str, port: int) -> bool:
+    try:
+        result = subprocess.run(
+            [adb_exe, "connect", f"127.0.0.1:{port}"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
+        )
+        out = (result.stdout + result.stderr).strip()
+        return "connected" in out.lower() or "already" in out.lower()
+    except Exception:
+        return False
+
+
+def _adb_shell(adb_exe: str, port: int, cmd: str, timeout: int = 30) -> tuple:
+    """Gui lenh shell. Returns (ok, output)."""
+    serial = f"127.0.0.1:{port}"
+    try:
+        result = subprocess.run(
+            [adb_exe, "-s", serial, "shell", cmd],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+        )
+        output = (result.stdout + result.stderr).strip()
+        return result.returncode == 0, output
+    except subprocess.TimeoutExpired:
+        return False, "TIMEOUT"
+    except Exception as exc:
+        return False, str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Humanized Behavior Primitives (dung ldconsole ADB bridge cho input)
 # ---------------------------------------------------------------------------
 
 def _adb(ld_console: str, index: int, command: str) -> tuple:
-    """Gửi lệnh ADB vào VM index qua ldconsole bridge."""
+    """Gui lenh ADB input vao VM (dung ldconsole bridge cho input swipe/tap)."""
     try:
         result = subprocess.run(
             [ld_console, "adb", "--index", str(index), "--command", command],
@@ -117,86 +228,46 @@ def _adb(ld_console: str, index: int, command: str) -> tuple:
         output = (result.stdout + result.stderr).strip()
         return result.returncode == 0, output
     except subprocess.TimeoutExpired:
-        logger.warning(f"[VM {index:02d}] ADB timeout: {command[:60]}")
         return False, "TIMEOUT"
     except Exception as exc:
-        logger.error(f"[VM {index:02d}] ADB exception: {exc}")
         return False, str(exc)
 
 
-# ---------------------------------------------------------------------------
-# Humanized Behavior Primitives
-# ---------------------------------------------------------------------------
-
 def _humanized_swipe(ld_console: str, index: int, cfg: dict) -> bool:
-    """
-    Vuốt lên để chuyển video với tọa độ và tốc độ được ngẫu nhiên hoá.
+    W  = cfg["SCREEN_WIDTH"]
+    H  = cfg["SCREEN_HEIGHT"]
+    cx = W // 2
 
-    Mô hình 3 chiều:
-      X: Gaussian(μ=center, σ=7% chiều rộng) — ngón tay không bao giờ chính tâm
-      Y: Uniform [65–78%] bắt đầu, vuốt [48–72%] chiều cao
-      Duration: Log-Normal(μ=350ms, σ=0.4) — đuôi dài về phía chậm như người thật
-    """
-    W = cfg["SCREEN_WIDTH"]   # 1080
-    H = cfg["SCREEN_HEIGHT"]  # 1920
-    cx = W // 2               # 540
-
-    # --- X axis ---
     x_start = int(random.gauss(cx, W * 0.07))
-    x_start = max(int(W * 0.18), min(int(W * 0.82), x_start))   # clamp [195, 885]
-    x_end   = x_start + int(random.gauss(0, 18))                  # drift ngang nhẹ
+    x_start = max(int(W * 0.18), min(int(W * 0.82), x_start))
+    x_end   = x_start + int(random.gauss(0, 18))
     x_end   = max(80, min(W - 80, x_end))
 
-    # --- Y axis ---
-    y_start     = int(random.uniform(H * 0.65, H * 0.78))          # [1248, 1498]
+    y_start     = int(random.uniform(H * 0.65, H * 0.78))
     swipe_ratio = random.uniform(0.48, 0.72)
     y_end       = int(y_start - H * swipe_ratio)
-    y_end       = max(int(H * 0.09), y_end)                        # không sát đỉnh
+    y_end       = max(int(H * 0.09), y_end)
 
-    # --- Duration: Log-Normal → range ~180–800ms ---
-    raw_dur = random.lognormvariate(math.log(350), 0.4)
+    raw_dur  = random.lognormvariate(math.log(350), 0.4)
     duration = int(max(180, min(800, raw_dur)))
 
     cmd = f"input swipe {x_start} {y_start} {x_end} {y_end} {duration}"
     ok, _ = _adb(ld_console, index, cmd)
-
-    # Micro-pause sau swipe (mắt nhìn vào màn hình trước khi đọc content)
     time.sleep(random.uniform(0.08, 0.35))
     return ok
 
 
 def _humanized_watch(index: int) -> float:
-    """
-    Giả lập thời gian xem video.
-
-    Phân phối:
-        8%  → video "hay": 45–60 giây (người bị cuốn)
-        92% → thường:      7–35 giây (lướt bình thường)
-
-    Returns:
-        Số giây đã ngủ (để log).
-    """
     if random.random() < 0.08:
-        # Video hay — dừng lại lâu hơn
         watch_sec = random.uniform(45, 60)
-        logger.info(f"[VM {index:02d}] 🎬 Video hay! Xem {watch_sec:.1f}s")
+        logger.info(f"[VM {index:02d}] Video hay! Xem {watch_sec:.1f}s")
     else:
         watch_sec = random.uniform(7, 35)
-
     time.sleep(watch_sec)
     return watch_sec
 
 
 def _maybe_like(ld_console: str, index: int, cfg: dict) -> bool:
-    """
-    Thả tim với xác suất 10–15% bằng double tap.
-    Tọa độ double tap được jitter ngẫu nhiên quanh trung tâm màn hình.
-    Tuyệt đối không like liên tục nhiều video liên tiếp.
-
-    Returns:
-        True nếu đã like, False nếu không.
-    """
-    # Xác suất like theo phiên: 10–15% (lấy ngưỡng random mỗi lần để không đều)
     like_threshold = random.uniform(0.10, 0.15)
     if random.random() > like_threshold:
         return False
@@ -204,23 +275,18 @@ def _maybe_like(ld_console: str, index: int, cfg: dict) -> bool:
     W = cfg["SCREEN_WIDTH"]
     H = cfg["SCREEN_HEIGHT"]
 
-    # Double tap: tap 1
     tap_x = W // 2 + int(random.gauss(0, 22))
     tap_y = int(H * 0.50) + int(random.gauss(0, 30))
     tap_x = max(100, min(W - 100, tap_x))
     tap_y = max(int(H * 0.30), min(int(H * 0.70), tap_y))
 
     _adb(ld_console, index, f"input tap {tap_x} {tap_y}")
-    # Khoảng cách giữa 2 tap của double tap: 80–140ms (ngưỡng Android)
     time.sleep(random.uniform(0.08, 0.14))
-    # Tap 2 — lệch nhẹ vài pixel so với tap 1 (ngón tay không đứng yên tuyệt đối)
     tap_x2 = tap_x + int(random.gauss(0, 4))
     tap_y2 = tap_y + int(random.gauss(0, 4))
     _adb(ld_console, index, f"input tap {tap_x2} {tap_y2}")
 
-    logger.info(f"[VM {index:02d}] ❤️  Like! ({tap_x},{tap_y})")
-
-    # Pause nhỏ sau like để giả lập phản ứng nhìn thấy animation
+    logger.info(f"[VM {index:02d}] Like! ({tap_x},{tap_y})")
     time.sleep(random.uniform(0.4, 1.2))
     return True
 
@@ -230,76 +296,323 @@ def _maybe_like(ld_console: str, index: int, cfg: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def _open_tiktok(ld_console: str, index: int, package: str) -> bool:
-    """Mở TikTok bằng am start và chờ app load."""
-    logger.info(f"[VM {index:02d}] Đang mở TikTok...")
+    logger.info(f"[VM {index:02d}] Dang mo TikTok...")
     cmd = f"am start -n {package}/.main.MainActivity"
     ok, output = _adb(ld_console, index, cmd)
     if ok:
-        # Chờ TikTok load FYP: 4–7 giây
         load_wait = random.uniform(4.0, 7.0)
-        logger.info(f"[VM {index:02d}] TikTok đã mở. Chờ FYP load {load_wait:.1f}s ...")
+        logger.info(f"[VM {index:02d}] TikTok da mo. Cho FYP load {load_wait:.1f}s ...")
         time.sleep(load_wait)
     else:
-        logger.error(f"[VM {index:02d}] Mở TikTok thất bại: {output}")
+        logger.error(f"[VM {index:02d}] Mo TikTok that bai: {output}")
     return ok
 
 
 def _kill_tiktok(ld_console: str, index: int, package: str) -> bool:
-    """Force-stop TikTok để kết thúc phiên sạch sẽ."""
-    logger.info(f"[VM {index:02d}] Đang kill TikTok...")
     ok, _ = _adb(ld_console, index, f"am force-stop {package}")
     return ok
 
 
 # ---------------------------------------------------------------------------
-# Session Engine — 1 phiên cho 1 VM
+# BUOC 1: Auto-Wake -- Bat VM va cho boot xong
 # ---------------------------------------------------------------------------
 
-def run_session(index: int, proxy: dict, cfg: dict) -> dict:
+def _launch_vm(ld_console: str, vm: dict) -> bool:
+    """Bat 1 VM bang ldconsole launch. Returns True neu lenh thanh cong."""
+    ok, out = _ld_cmd(ld_console, "launch", "--index", str(vm["index"]), timeout=30)
+    if ok:
+        logger.info(f"[{vm['name']}] Da gui lenh launch.")
+    else:
+        logger.error(f"[{vm['name']}] launch that bai: {out[:80]}")
+    return ok
+
+
+def _wait_boot(adb_exe: str, vm: dict, timeout: int = BOOT_TIMEOUT_SEC) -> bool:
     """
-    Chạy 1 phiên lướt TikTok hoàn chỉnh cho VM `index`.
+    Vong lap cho Android boot xong.
+    Dieu kien san sang: adb shell getprop sys.boot_completed == "1"
+    """
+    port  = _adb_port(vm["index"])
+    name  = vm["name"]
+    label = f"[{name}] [port={port}]"
 
-    Phiên kéo dài SESSION_MIN_SEC–SESSION_MAX_SEC giây (15–20 phút).
-    Trong mỗi vòng lặp:
-        1. Xem video (_humanized_watch)
-        2. Vuốt qua video tiếp theo (_humanized_swipe)
-        3. Thỉnh thoảng like (_maybe_like)
+    deadline = time.time() + timeout
+    attempts = 0
+    while time.time() < deadline:
+        attempts += 1
+        _adb_connect(adb_exe, port)
+        ok, out = _adb_shell(adb_exe, port, "getprop sys.boot_completed", timeout=8)
+        if ok and out.strip() == "1":
+            logger.info(f"{label} Boot xong (attempt {attempts}).")
+            return True
+        time.sleep(BOOT_POLL_SEC)
 
-    Args:
-        index: VM index (1-based)
-        proxy: dict {"ip", "port", "user", "pass"} — dùng để log
-        cfg:   config dict
+    logger.error(f"{label} TIMEOUT: Android chua boot xong sau {timeout}s. Bo qua VM nay.")
+    return False
+
+
+def auto_wake_all(cfg: dict) -> list:
+    """
+    Buoc 1: Bat tat ca VM chua chay, cho Android boot xong.
+
+    Quy trinh:
+      1. Lay danh sach tat ca VM (list2)
+      2. Check xem VM nao chua chay (isrunning)
+      3. Launch VM chua chay bang ldconsole launch
+      4. Cho tat ca VM boot xong bang getprop sys.boot_completed (timeout 90s)
 
     Returns:
-        dict kết quả phiên: {index, videos_watched, likes, session_sec, status}
+      list VM da san sang [{index, name}] -- chi VM boot thanh cong.
+    """
+    ld_console = cfg["_LD_CONSOLE"]
+    adb_exe    = cfg["_ADB_EXE"]
+
+    all_vms = _ld_get_all_vms(ld_console)
+    if not all_vms:
+        logger.error("Khong tim thay VM nao trong LDPlayer (kiem tra ldconsole list2).")
+        return []
+
+    logger.info("=" * 64)
+    logger.info(f"  BUOC 1: AUTO-WAKE -- {len(all_vms)} VM")
+    logger.info("=" * 64)
+
+    # Launch VM chua chay
+    launched = []
+    for vm in all_vms:
+        if _ld_is_running(ld_console, vm["index"]):
+            logger.info(f"[{vm['name']}] Da chay san sang.")
+            launched.append(vm)
+        else:
+            logger.info(f"[{vm['name']}] Chua chay -- dang launch...")
+            if _launch_vm(ld_console, vm):
+                launched.append(vm)
+                time.sleep(1.5)   # Tranh khoi dong qua nhieu VM cung luc
+
+    if not launched:
+        logger.error("Khong launch duoc VM nao.")
+        return []
+
+    # Cho tat ca VM boot xong (song song)
+    logger.info(f"Cho {len(launched)} VM boot xong (timeout {BOOT_TIMEOUT_SEC}s/VM)...")
+    ready_vms = []
+
+    with ThreadPoolExecutor(max_workers=min(4, len(launched))) as pool:
+        futures = {pool.submit(_wait_boot, adb_exe, vm): vm for vm in launched}
+        for future in as_completed(futures):
+            vm = futures[future]
+            try:
+                if future.result():
+                    ready_vms.append(vm)
+            except Exception as exc:
+                logger.error(f"[{vm['name']}] Exception khi cho boot: {exc}")
+
+    ready_vms.sort(key=lambda v: v["index"])
+    logger.info(f"AUTO-WAKE XONG: {len(ready_vms)}/{len(launched)} VM san sang.")
+    return ready_vms
+
+
+# ---------------------------------------------------------------------------
+# BUOC 2: Pre-flight Check -- Kiem tra IP, bat proxy neu can
+# ---------------------------------------------------------------------------
+
+# Lock dung cho buoc bat SocksDroid (UI Automator khong duoc chay dong thoi)
+_PROXY_CONFIGURE_LOCK = threading.Lock()
+
+
+def _check_ip_on_vm(adb_exe: str, vm: dict) -> str:
+    """
+    Check IP hien tai tren VM bang curl/wget (fallback).
+    Returns IP string hoac "" neu loi.
+    """
+    port  = _adb_port(vm["index"])
+    label = f"[{vm['name']}]"
+
+    # Chon endpoint ngau nhien de tranh rate-limit
+    endpoint = random.choice(IP_CHECK_ENDPOINTS)
+
+    # Thu curl truoc
+    ok, out = _adb_shell(adb_exe, port,
+                          f"curl -s --max-time 10 {endpoint}", timeout=15)
+    if not ok or not out.strip():
+        # Fallback: wget
+        logger.info(f"{label} curl that bai, thu wget...")
+        ok, out = _adb_shell(adb_exe, port,
+                              f"wget -q -O - {endpoint}", timeout=15)
+
+    if not ok or not out.strip():
+        logger.warning(f"{label} Khong lay duoc IP (ca curl va wget deu that bai).")
+        return ""
+
+    return out.strip()
+
+
+def _is_us_ip(response_str: str) -> bool:
+    """
+    Kiem tra xem response co chua indicator IP My khong.
+    Ho tro output tu: api.myip.com, ipinfo.io, ip-api.com
+    """
+    low = response_str.lower()
+    return (
+        '"united states"' in low
+        or '"us"' in low
+        or '"country":"us"' in low
+        or '"country": "us"' in low
+        or 'united states' in low
+    )
+
+
+def _worker_preflight(adb_exe: str, vm: dict, proxy: dict, cfg: dict) -> dict:
+    """
+    Worker thread: kiem tra IP cho 1 VM va bat proxy neu can.
+    Returns {vm, proxy, ip_ok: bool, action: str}
+    """
+    port  = _adb_port(vm["index"])
+    label = f"[{vm['name']}] [idx={vm['index']}] [port={port}]"
+    result = {"vm": vm, "proxy": proxy, "ip_ok": False, "action": "unknown"}
+
+    if not _adb_connect(adb_exe, port):
+        logger.error(f"{label} Khong the ket noi ADB.")
+        result["action"] = "adb_fail"
+        return result
+
+    # Lan 1: Kiem tra IP
+    response = _check_ip_on_vm(adb_exe, vm)
+    if _is_us_ip(response):
+        logger.info(f"{label} IP My hop le. Mang an toan.")
+        result["ip_ok"] = True
+        result["action"] = "ok"
+        return result
+
+    # IP khong hop le -> bat SocksDroid (de tranh crash UI Automator, dung Lock)
+    logger.warning(f"{label} IP khong phai My ({response[:60]}) -- Dang bat proxy...")
+
+    with _PROXY_CONFIGURE_LOCK:
+        logger.info(f"{label} [LOCK] Bat SocksDroid voi proxy {proxy['ip']}:{proxy['port']}...")
+        try:
+            # Lazy import proxy_manager (tranh side-effect khi import o cap module)
+            import importlib
+            pm = importlib.import_module("proxy_manager")
+            ok_cfg = pm.configure_proxy(adb_exe, vm["index"], vm["name"], proxy)
+        except Exception as exc:
+            logger.error(f"{label} Loi khi goi proxy_manager.configure_proxy: {exc}")
+            ok_cfg = False
+
+    if not ok_cfg:
+        logger.error(f"{label} Bat SocksDroid that bai -- Bo qua VM nay.")
+        result["action"] = "proxy_fail"
+        return result
+
+    # Doi SocksDroid ket noi
+    time.sleep(3.0)
+
+    # Lan 2: Re-verify IP
+    response2 = _check_ip_on_vm(adb_exe, vm)
+    if _is_us_ip(response2):
+        logger.info(f"{label} Re-verify OK -- IP da doi thanh My.")
+        result["ip_ok"] = True
+        result["action"] = "proxy_fixed"
+    else:
+        logger.error(
+            f"{label} Re-verify FAIL -- IP van khong phai My ({response2[:60]}). "
+            "VM nay se KHONG duoc mo TikTok."
+        )
+        result["action"] = "ip_fail"
+
+    return result
+
+
+def preflight_check_all(cfg: dict, running_vms: list, proxies: list) -> list:
+    """
+    Buoc 2: Kiem tra IP song song tren tat ca VM.
+
+    - IP check: song song (ThreadPoolExecutor, PREFLIGHT_WORKERS threads)
+    - SocksDroid configure: tuyen tu (bao ve boi _PROXY_CONFIGURE_LOCK)
+    - VM pass preflight -> duoc dua vao danh sach farm
+    - VM fail -> bao loi do, loai khoi danh sach
+
+    Returns:
+        list tuple (vm, proxy) cua cac VM passed pre-flight.
+    """
+    adb_exe = cfg["_ADB_EXE"]
+
+    logger.info("=" * 64)
+    logger.info(f"  BUOC 2: PRE-FLIGHT CHECK -- {len(running_vms)} VM")
+    logger.info(f"  Endpoint: {IP_CHECK_ENDPOINTS}")
+    logger.info("=" * 64)
+
+    # Ghep VM voi proxy tuand tu
+    if len(proxies) < len(running_vms):
+        logger.error(f"Khong du proxy ({len(proxies)}) cho {len(running_vms)} VM.")
+        sys.exit(1)
+
+    vm_proxy_pairs = [(vm, proxies[seq]) for seq, vm in enumerate(running_vms)]
+
+    passed = []
+    with ThreadPoolExecutor(max_workers=PREFLIGHT_WORKERS) as pool:
+        futures = {
+            pool.submit(_worker_preflight, adb_exe, vm, proxy, cfg): (vm, proxy)
+            for vm, proxy in vm_proxy_pairs
+        }
+        for future in as_completed(futures):
+            vm, proxy = futures[future]
+            try:
+                r = future.result()
+                if r["ip_ok"]:
+                    passed.append((vm, proxy))
+                else:
+                    logger.error(
+                        f"[{vm['name']}] PRE-FLIGHT FAIL (action={r['action']}). "
+                        "Loai khoi danh sach farm session."
+                    )
+            except Exception as exc:
+                logger.error(f"[{vm['name']}] Exception trong pre-flight: {exc}")
+
+    passed.sort(key=lambda x: x[0]["index"])
+    ok_count   = len(passed)
+    fail_count = len(running_vms) - ok_count
+    logger.info(f"PRE-FLIGHT XONG: {ok_count} pass / {fail_count} fail / {len(running_vms)} tong")
+    return passed
+
+
+# ---------------------------------------------------------------------------
+# BUOC 3: Session Engine -- 1 phien cho 1 VM
+# ---------------------------------------------------------------------------
+
+def run_session(vm: dict, proxy: dict, cfg: dict) -> dict:
+    """
+    Chay 1 phien luot TikTok hoan chinh cho VM.
+
+    Args:
+        vm:    {index, name} - thong tin VM thuc te tu ldconsole
+        proxy: {ip, port, user, pass}
+        cfg:   config dict
     """
     ld_console  = cfg["_LD_CONSOLE"]
     package     = cfg["TIKTOK_PACKAGE"]
+    # Dung ldplayer_index lam index hien thi (1-based tinh tu vi tri trong running list)
+    index       = vm["index"]
     session_sec = random.uniform(cfg["SESSION_MIN_SEC"], cfg["SESSION_MAX_SEC"])
 
     logger.info(
-        f"[VM {index:02d}] ▶ Bắt đầu phiên "
-        f"({session_sec/60:.1f} phút | proxy: {proxy['ip']}:{proxy['port']})"
+        f"[{vm['name']}] Bat dau phien "
+        f"({session_sec/60:.1f} phut | proxy: {proxy['ip']}:{proxy['port']})"
     )
 
-    result = {"index": index, "videos_watched": 0, "likes": 0,
+    result = {"vm": vm["name"], "index": index, "videos_watched": 0, "likes": 0,
               "session_sec": round(session_sec), "status": "ok"}
 
-    # Mở TikTok
     if not _open_tiktok(ld_console, index, package):
         result["status"] = "error_open"
         return result
 
-    session_start = time.monotonic()
-    last_like_video = -99  # Chống like liên tiếp: ít nhất 5 video giữa 2 lần like
+    session_start   = time.monotonic()
+    last_like_video = -99
 
     try:
         while (time.monotonic() - session_start) < session_sec:
-            # 1. Xem video hiện tại
             _humanized_watch(index)
             result["videos_watched"] += 1
 
-            # 2. Thỉnh thoảng like — không like video liền kề
             current_video = result["videos_watched"]
             if (current_video - last_like_video) >= 5:
                 liked = _maybe_like(ld_console, index, cfg)
@@ -307,82 +620,84 @@ def run_session(index: int, proxy: dict, cfg: dict) -> dict:
                     result["likes"] += 1
                     last_like_video = current_video
 
-            # 3. Kiểm tra còn thời gian không trước khi swipe
             if (time.monotonic() - session_start) >= session_sec:
                 break
-
-            # 4. Vuốt sang video tiếp
             _humanized_swipe(ld_console, index, cfg)
 
     except Exception as exc:
-        logger.error(f"[VM {index:02d}] Lỗi trong phiên: {exc}")
+        logger.error(f"[{vm['name']}] Loi trong phien: {exc}")
         result["status"] = "error_runtime"
 
-    # Kết thúc phiên
     _kill_tiktok(ld_console, index, package)
-    elapsed = time.monotonic() - session_start
+    elapsed   = time.monotonic() - session_start
     like_rate = result["likes"] / max(1, result["videos_watched"]) * 100
 
     logger.info(
-        f"[VM {index:02d}] ■ Kết thúc phiên | "
+        f"[{vm['name']}] Ket thuc phien | "
         f"{result['videos_watched']} video | "
         f"{result['likes']} likes ({like_rate:.1f}%) | "
-        f"{elapsed/60:.1f} phút | status: {result['status']}"
+        f"{elapsed/60:.1f} phut | status: {result['status']}"
     )
     return result
 
 
 # ---------------------------------------------------------------------------
-# Farm Orchestrator — ThreadPoolExecutor 10 VM song song
+# Farm Orchestrator -- 3 buoc
 # ---------------------------------------------------------------------------
 
 def farm_all(cfg: dict, proxies: list) -> None:
     """
-    Điều phối 10 VM lướt TikTok CÙNG MỘT LÚC bằng ThreadPoolExecutor.
-
-    Lý do chọn Thread thay vì Process:
-        - Workload I/O-bound (90% là time.sleep + ADB subprocess)
-        - GIL được release trong sleep() và subprocess.run()
-        - Không cần serialize/deserialize data giữa process
-        - Ít overhead hơn trên hệ thống 56-thread hiện tại
+    Dieu phoi toan bo farm:
+      Buoc 1: auto_wake_all()       -- bat VM + cho boot
+      Buoc 2: preflight_check_all() -- kiem tra IP, bat SocksDroid neu can
+      Buoc 3: run_session()         -- chi chay VM da pass pre-flight (song song)
     """
-    count = cfg["INSTANCE_COUNT"]
-    if len(proxies) < count:
-        logger.error(f"Cần {count} proxy, hiện có {len(proxies)}. Kiểm tra {PROXIES_FILE}.")
-        sys.exit(1)
-
-    logger.info("=" * 64)
-    logger.info(f"  FARM BẮT ĐẦU: {count} VM | ThreadPoolExecutor(max_workers={count})")
-    logger.info("=" * 64)
-
     farm_start = time.monotonic()
-    results = []
 
+    # BUOC 1: Auto-Wake
+    ready_vms = auto_wake_all(cfg)
+    if not ready_vms:
+        logger.error("Khong co VM nao san sang sau Auto-Wake. Dung lai.")
+        return
+
+    # BUOC 2: Pre-flight
+    passed = preflight_check_all(cfg, ready_vms, proxies)
+    if not passed:
+        logger.error("Khong co VM nao pass Pre-flight. Tuyet doi khong mo TikTok.")
+        return
+
+    # BUOC 3: Farm session song song
+    count = len(passed)
+    logger.info("=" * 64)
+    logger.info(f"  BUOC 3: FARM BAT DAU -- {count} VM (ThreadPoolExecutor)")
+    logger.info("=" * 64)
+
+    results = []
     with ThreadPoolExecutor(max_workers=count) as pool:
         futures = {
-            pool.submit(run_session, i, proxies[i - 1], cfg): i
-            for i in range(1, count + 1)
+            pool.submit(run_session, vm, proxy, cfg): (vm, proxy)
+            for vm, proxy in passed
         }
         for future in as_completed(futures):
-            vm_idx = futures[future]
+            vm, proxy = futures[future]
             try:
                 res = future.result()
                 results.append(res)
             except Exception as exc:
-                logger.error(f"[VM {vm_idx:02d}] Future exception: {exc}")
-                results.append({"index": vm_idx, "status": "future_error"})
+                logger.error(f"[{vm['name']}] Future exception: {exc}")
+                results.append({"vm": vm["name"], "status": "future_error"})
 
-    # Tổng kết farm
-    elapsed = time.monotonic() - farm_start
+    # Tong ket
+    elapsed      = time.monotonic() - farm_start
     total_videos = sum(r.get("videos_watched", 0) for r in results)
     total_likes  = sum(r.get("likes", 0) for r in results)
     ok_count     = sum(1 for r in results if r.get("status") == "ok")
 
     logger.info("=" * 64)
-    logger.info(f"  FARM HOÀN TẤT trong {elapsed/60:.1f} phút")
-    logger.info(f"  VM thành công: {ok_count}/{count}")
-    logger.info(f"  Tổng video đã xem: {total_videos}")
-    logger.info(f"  Tổng lượt like:    {total_likes} "
+    logger.info(f"  FARM HOAN TAT trong {elapsed/60:.1f} phut")
+    logger.info(f"  VM thanh cong: {ok_count}/{count}")
+    logger.info(f"  Tong video da xem: {total_videos}")
+    logger.info(f"  Tong luot like:    {total_likes} "
                 f"({total_likes/max(1,total_videos)*100:.1f}%)")
     logger.info("=" * 64)
 
@@ -392,11 +707,13 @@ def farm_all(cfg: dict, proxies: list) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    valid = ("start", "session")
+    valid = ("start", "session", "wake", "preflight")
     if len(sys.argv) < 2 or sys.argv[1] not in valid:
-        print(f"\nCách dùng: python {os.path.basename(__file__)} <command>\n")
-        print("  start        — Chạy farm 10 VM song song (ThreadPoolExecutor)")
-        print("  session <n>  — Chạy 1 phiên thử cho VM index n\n")
+        print(f"\nCach dung: python {os.path.basename(__file__)} <command>\n")
+        print("  start              -- Chay full pipeline (Wake -> Preflight -> Farm) 10 VM")
+        print("  session <n>        -- Chay 1 phien thu cho VM index n (1-based)")
+        print("  wake               -- Chi chay Buoc 1: Auto-Wake tat ca VM")
+        print("  preflight          -- Chi chay Buoc 2: Pre-flight check + bat proxy\n")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -406,26 +723,45 @@ def main():
     if command == "start":
         farm_all(cfg, proxies)
 
+    elif command == "wake":
+        ready = auto_wake_all(cfg)
+        logger.info(f"Wake xong: {len(ready)} VM san sang.")
+
+    elif command == "preflight":
+        running = _ld_get_running(cfg["_LD_CONSOLE"])
+        if not running:
+            logger.error("Khong co VM nao dang chay. Chay 'wake' truoc.")
+            sys.exit(1)
+        passed = preflight_check_all(cfg, running, proxies)
+        logger.info(f"Pre-flight xong: {len(passed)} VM pass.")
+
     elif command == "session":
         if len(sys.argv) < 3:
-            print("Thiếu index VM. Ví dụ: python tiktok_farmer.py session 1")
+            print("Thieu index VM. Vi du: python tiktok_farmer.py session 1")
             sys.exit(1)
         try:
             idx = int(sys.argv[2])
         except ValueError:
-            print("Index phải là số nguyên.")
+            print("Index phai la so nguyen.")
             sys.exit(1)
 
         count = cfg["INSTANCE_COUNT"]
         if not (1 <= idx <= count):
-            print(f"Index phải nằm trong [1, {count}].")
+            print(f"Index phai nam trong [1, {count}].")
             sys.exit(1)
-
         if len(proxies) < idx:
-            print(f"Không có proxy cho VM {idx}.")
+            print(f"Khong co proxy cho VM {idx}.")
             sys.exit(1)
 
-        result = run_session(idx, proxies[idx - 1], cfg)
+        # Tim VM theo index trong danh sach dang chay
+        running = _ld_get_running(cfg["_LD_CONSOLE"])
+        vm_match = next((v for v in running if v["index"] == idx), None)
+        if not vm_match:
+            # Neu khong tim thay trong running, tao provisional vm dict
+            vm_match = {"index": idx, "name": f"TikTok_US_{idx:02d}"}
+            logger.warning(f"VM index {idx} khong co trong danh sach dang chay. Thu chay thu.")
+
+        result = run_session(vm_match, proxies[idx - 1], cfg)
         logger.info(f"Session result: {result}")
 
 
