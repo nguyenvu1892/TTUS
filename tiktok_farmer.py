@@ -351,15 +351,13 @@ def _wait_boot(adb_exe: str, vm: dict, timeout: int = BOOT_TIMEOUT_SEC) -> bool:
     return False
 
 
-def auto_wake_all(cfg: dict) -> list:
+def auto_wake_all(cfg: dict, start_index: int = 1, end_index: int = 10) -> list:
     """
-    Buoc 1: Bat tat ca VM chua chay, cho Android boot xong.
+    Buoc 1: Bat cac VM trong pham vi [start_index, end_index], cho Android boot xong.
 
-    Quy trinh:
-      1. Lay danh sach tat ca VM (list2)
-      2. Check xem VM nao chua chay (isrunning)
-      3. Launch VM chua chay bang ldconsole launch
-      4. Cho tat ca VM boot xong bang getprop sys.boot_completed (timeout 90s)
+    Luu y:
+      - Index 0 (may goc / LDPlayer template) bi loai tru tuyet doi.
+      - Chi bat VM co index nam trong [start_index, end_index].
 
     Returns:
       list VM da san sang [{index, name}] -- chi VM boot thanh cong.
@@ -372,13 +370,26 @@ def auto_wake_all(cfg: dict) -> list:
         logger.error("Khong tim thay VM nao trong LDPlayer (kiem tra ldconsole list2).")
         return []
 
+    # -- FILTER: Loai may goc (index=0) va chi lay VM trong khoang target --
+    target_vms = [
+        vm for vm in all_vms
+        if vm["index"] != 0 and start_index <= vm["index"] <= end_index
+    ]
+
+    if not target_vms:
+        logger.error(
+            f"Khong co VM nao trong khoang index [{start_index}, {end_index}]. "
+            "Kiem tra lai tham so hoac danh sach VM."
+        )
+        return []
+
     logger.info("=" * 64)
-    logger.info(f"  BUOC 1: AUTO-WAKE -- {len(all_vms)} VM")
+    logger.info(f"  BUOC 1: AUTO-WAKE -- {len(target_vms)} VM (index {start_index}~{end_index})")
     logger.info("=" * 64)
 
     # Launch VM chua chay
     launched = []
-    for vm in all_vms:
+    for vm in target_vms:
         if _ld_is_running(ld_console, vm["index"]):
             logger.info(f"[{vm['name']}] Da chay san sang.")
             launched.append(vm)
@@ -386,7 +397,7 @@ def auto_wake_all(cfg: dict) -> list:
             logger.info(f"[{vm['name']}] Chua chay -- dang launch...")
             if _launch_vm(ld_console, vm):
                 launched.append(vm)
-                time.sleep(1.5)   # Tranh khoi dong qua nhieu VM cung luc
+                time.sleep(1.5)
 
     if not launched:
         logger.error("Khong launch duoc VM nao.")
@@ -645,22 +656,33 @@ def run_session(vm: dict, proxy: dict, cfg: dict) -> dict:
 # Farm Orchestrator -- 3 buoc
 # ---------------------------------------------------------------------------
 
-def farm_all(cfg: dict, proxies: list) -> None:
+def farm_all(cfg: dict, proxies: list,
+             start_index: int = 1, end_index: int = 10) -> None:
     """
-    Dieu phoi toan bo farm:
-      Buoc 1: auto_wake_all()       -- bat VM + cho boot
-      Buoc 2: preflight_check_all() -- kiem tra IP, bat SocksDroid neu can
-      Buoc 3: run_session()         -- chi chay VM da pass pre-flight (song song)
+    Dieu phoi toan bo farm (3 buoc).
+
+    Args:
+        start_index: Index VM bat dau (inclusive, mac dinh 1).
+        end_index:   Index VM ket thuc (inclusive, mac dinh 10).
+                     Chi tinh index >= 1; index 0 bi loai tuyet doi.
     """
     farm_start = time.monotonic()
 
-    # BUOC 1: Auto-Wake
-    ready_vms = auto_wake_all(cfg)
+    # BUOC 1: Auto-Wake (chi VM trong khoang va khong phai index 0)
+    ready_vms = auto_wake_all(cfg, start_index=start_index, end_index=end_index)
     if not ready_vms:
         logger.error("Khong co VM nao san sang sau Auto-Wake. Dung lai.")
         return
 
-    # BUOC 2: Pre-flight
+    # BUOC 2: Pre-flight (proxy duoc slice theo so VM thuc te, khong hard-code 10)
+    #   Map tuan tu: ready_vms[0] <-> proxies[0], ready_vms[1] <-> proxies[1], ...
+    if len(proxies) < len(ready_vms):
+        logger.error(
+            f"Khong du proxy ({len(proxies)}) cho {len(ready_vms)} VM san sang. "
+            "Them proxy vao data/proxies_list.txt."
+        )
+        return
+
     passed = preflight_check_all(cfg, ready_vms, proxies)
     if not passed:
         logger.error("Khong co VM nao pass Pre-flight. Tuyet doi khong mo TikTok.")
@@ -709,22 +731,43 @@ def farm_all(cfg: dict, proxies: list) -> None:
 def main():
     valid = ("start", "session", "wake", "preflight")
     if len(sys.argv) < 2 or sys.argv[1] not in valid:
-        print(f"\nCach dung: python {os.path.basename(__file__)} <command>\n")
-        print("  start              -- Chay full pipeline (Wake -> Preflight -> Farm) 10 VM")
-        print("  session <n>        -- Chay 1 phien thu cho VM index n (1-based)")
-        print("  wake               -- Chi chay Buoc 1: Auto-Wake tat ca VM")
-        print("  preflight          -- Chi chay Buoc 2: Pre-flight check + bat proxy\n")
+        print(f"\nCach dung: python {os.path.basename(__file__)} <command> [from N] [to M]\n")
+        print("  start [from N] [to M]  -- Full pipeline (Wake->Preflight->Farm)")
+        print("    VD: start            -> chay VM index 1 den 10 (mac dinh)")
+        print("    VD: start from 1 to 5 -> chi chay VM index 1, 2, 3, 4, 5")
+        print("  session <n>            -- Chay 1 phien thu cho VM index n")
+        print("  wake [from N] [to M]   -- Chi chay Buoc 1: Auto-Wake")
+        print("  preflight              -- Chi chay Buoc 2: Pre-flight check\n")
         sys.exit(1)
 
     command = sys.argv[1]
     cfg     = load_config()
     proxies = load_proxies()
 
+    # Parse optional [from N] [to M] args cho start va wake
+    def _parse_range(argv, default_start=1, default_end=10):
+        """Trich xuat 'from N to M' tu argv. Vi du: ['start', 'from', '1', 'to', '5']"""
+        s, e = default_start, default_end
+        try:
+            if "from" in argv:
+                s = int(argv[argv.index("from") + 1])
+            if "to" in argv:
+                e = int(argv[argv.index("to") + 1])
+        except (ValueError, IndexError):
+            pass
+        if s < 1:
+            s = 1  # Khoa cung: tuyet doi khong cho index 0
+        return s, e
+
     if command == "start":
-        farm_all(cfg, proxies)
+        s, e = _parse_range(sys.argv)
+        logger.info(f"RANGE: farm VM index {s} -> {e}")
+        farm_all(cfg, proxies, start_index=s, end_index=e)
 
     elif command == "wake":
-        ready = auto_wake_all(cfg)
+        s, e = _parse_range(sys.argv)
+        logger.info(f"RANGE: wake VM index {s} -> {e}")
+        ready = auto_wake_all(cfg, start_index=s, end_index=e)
         logger.info(f"Wake xong: {len(ready)} VM san sang.")
 
     elif command == "preflight":
