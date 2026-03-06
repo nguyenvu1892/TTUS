@@ -267,6 +267,124 @@ def configure_all_instances() -> None:
 
 
 # ===========================================================================
+# OPTIMIZE VMS -- Ep cau hinh toi thieu de tiet kiem tai nguyen
+# ===========================================================================
+
+# Cac tham so toi uu cho moi truong Farm (TikTok + SocksDroid)
+_OPTIMIZE_SETTINGS = {
+    "advancedSettings.cpuCount"     : 2,       # 2 core du chay SocksDroid+TikTok
+    "advancedSettings.memorySize"   : 1536,    # 1536MB: toi thieu tranh OOM kill
+    "advancedSettings.resolution"   : {"width": 720, "height": 1280},  # Giu nguyen toa do ADB
+    "advancedSettings.resolutionDpi": 240,     # DPI nhe hon (320 -> 240)
+    "basicSettings.fps"             : 20,      # 20fps: du mua man hinh, tiet kiem CPU
+    "advancedSettings.micphoneName" : "",      # Tat mic (chuoi rong = disable)
+    "advancedSettings.speakerName"  : "",      # Tat speaker
+}
+
+
+def optimize_all_vms() -> dict:
+    """
+    Chinh sua truc tiep file JSON config cua tung VM de ep ve cau hinh toi thieu.
+
+    Phuong phap:
+      - Doc file leidianX.config (JSON)
+      - Merge _OPTIMIZE_SETTINGS vao config hien tai
+      - Ghi lai file
+
+    Bao ve an toan (QUAN TRONG):
+      - Kiem tra isrunning truoc khi ghi. Neu VM dang chay -> log WARNING, bo qua.
+      - Neu khong tim thay file config -> log WARNING, bo qua.
+      - Ghi tam sang .tmp truoc, rename sau de tranh corrupt khi bi gian doan.
+
+    Returns:
+      dict {vm_name: 'ok' | 'skipped_running' | 'skipped_not_found' | 'error'}
+    """
+    ld_path    = Path(CFG["LDPLAYER_PATH"])
+    config_dir = ld_path / "vms" / "config"
+    existing   = list_instances()   # {name: index}
+
+    if not config_dir.exists():
+        log.error(f"[OPTIMIZE] Khong tim thay thu muc config: {config_dir}")
+        return {}
+
+    log.info("=" * 60)
+    log.info(f"[OPTIMIZE] Bat dau toi uu cau hinh {len(existing)} VM...")
+    log.info(f"[OPTIMIZE] Thu muc config: {config_dir}")
+    log.info("=" * 60)
+
+    results = {}
+    for name, idx in sorted(existing.items(), key=lambda x: x[1]):
+        config_file = config_dir / f"leidian{idx}.config"
+        label       = f"[OPTIMIZE] [{name}] [idx={idx}]"
+
+        # -- Bao ve an toan: kiem tra VM dang chay khong --
+        try:
+            status = get_instance_status(idx)
+        except Exception as exc:
+            log.warning(f"{label} Khong kiem tra duoc trang thai: {exc}. Bo qua.")
+            results[name] = "error"
+            continue
+
+        if status == "running":
+            log.warning(
+                f"{label} VM DANG CHAY -- Bo qua de tranh corrupt file config. "
+                "Tat VM roi chay lai lenh 'optimize'."
+            )
+            results[name] = "skipped_running"
+            continue
+
+        # -- Kiem tra file config ton tai --
+        if not config_file.exists():
+            log.warning(f"{label} Khong tim thay file config: {config_file}")
+            results[name] = "skipped_not_found"
+            continue
+
+        # -- Doc config hien tai --
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+        except Exception as exc:
+            log.error(f"{label} Loi khi doc file config: {exc}")
+            results[name] = "error"
+            continue
+
+        # -- Merge _OPTIMIZE_SETTINGS vao config --
+        original_cpu = config_data.get("advancedSettings.cpuCount", "?")
+        original_ram = config_data.get("advancedSettings.memorySize", "?")
+        original_fps = config_data.get("basicSettings.fps", "?")
+        config_data.update(_OPTIMIZE_SETTINGS)
+
+        # -- Ghi lai file (qua file tam de tranh corrupt) --
+        tmp_file = config_file.with_suffix(".config.tmp")
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, indent=4, ensure_ascii=False)
+            tmp_file.replace(config_file)   # atomic rename tren cung partition
+            log.info(
+                f"{label} OK | "
+                f"CPU: {original_cpu} -> {_OPTIMIZE_SETTINGS['advancedSettings.cpuCount']} | "
+                f"RAM: {original_ram}MB -> {_OPTIMIZE_SETTINGS['advancedSettings.memorySize']}MB | "
+                f"FPS: {original_fps} -> {_OPTIMIZE_SETTINGS['basicSettings.fps']}"
+            )
+            results[name] = "ok"
+        except Exception as exc:
+            log.error(f"{label} Loi khi ghi file config: {exc}")
+            if tmp_file.exists():
+                tmp_file.unlink()
+            results[name] = "error"
+
+    # -- Tong ket --
+    ok_count   = sum(1 for v in results.values() if v == "ok")
+    skip_count = sum(1 for v in results.values() if v.startswith("skipped"))
+    err_count  = sum(1 for v in results.values() if v == "error")
+    log.info(
+        f"[OPTIMIZE] HOAN TAT: {ok_count} OK / {skip_count} bo qua / "
+        f"{err_count} loi / {len(results)} tong"
+    )
+    return results
+
+
+# ===========================================================================
 # STATUS MONITORING
 # ===========================================================================
 
@@ -333,7 +451,7 @@ def load_state() -> dict:
 # ===========================================================================
 
 def full_setup() -> None:
-    """Quy trinh day du: Tao + Cau hinh + Query + Luu state."""
+    """Quy trinh day du: Base Config + Tao Instance + Toi Uu + Device Spoof + Save State."""
     log.info("=" * 60)
     log.info("BAT DAU: Quy trinh khoi tao TikTok Affiliate Farm")
     log.info("=" * 60)
@@ -344,15 +462,18 @@ def full_setup() -> None:
     log.info("--- BUOC 1: Tao Instance (copy --from 0) ---")
     create_instances()
 
-    log.info("--- BUOC 2: Device Spoofing (IMEI/Model ke thua Root+ADB tu may goc) ---")
+    log.info("--- BUOC 2: Toi Uu Cau Hinh (CPU/RAM/FPS/Audio - sua JSON config truc tiep) ---")
+    optimize_all_vms()
+
+    log.info("--- BUOC 3: Device Spoofing (IMEI/Model ke thua Root+ADB tu may goc) ---")
     configure_all_instances()
 
-    log.info("--- BUOC 3: Query & Luu Trang Thai ---")
+    log.info("--- BUOC 4: Query & Luu Trang Thai ---")
     save_state()
 
     log.info("=" * 60)
     log.info("HOAN TAT: Xem trang thai tai data/instances_state.json")
-    log.info("=" * 60)
+    log.info("="  * 60)
 
 
 def status_report() -> None:
@@ -378,9 +499,10 @@ if __name__ == "__main__":
         print("""
 LDPlayer Manager - TikTok Shop Affiliate Farm
 Usage:
-  python ld_manager.py setup           # Full setup (base config + create + spoof + status)
+  python ld_manager.py setup           # Full setup (base config + create + optimize + spoof + status)
   python ld_manager.py configure-base  # Chi cau hinh may goc index=0 lam template
   python ld_manager.py create          # Chi tao 10 instance (copy --from 0)
+  python ld_manager.py optimize        # Ep cau hinh toi thieu (CPU/RAM/FPS/Audio) -- VM phai tat
   python ld_manager.py configure       # Chi chay device spoofing tren 10 may
   python ld_manager.py status          # Query & save status report
   python ld_manager.py list            # List all existing instances
@@ -394,6 +516,8 @@ Usage:
         configure_base_instance()
     elif cmd == "create":
         create_instances()
+    elif cmd == "optimize":
+        optimize_all_vms()
     elif cmd == "configure":
         configure_all_instances()
     elif cmd == "status":
