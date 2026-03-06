@@ -643,25 +643,65 @@ def configure_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict
                     time.sleep(0.5)
                     break
 
-        # 4. Dien 4 truong Preference -- STRICT: fail 1 truong -> DUNG NGAY, KHONG bat VPN
-        #    Label text phai khop CHINH XAC voi text hien thi tren giao dien SocksDroid
-        logger.info(f"{label} [4/5] Dien thong so proxy...")
-        fields = [
-            ("Server IP",   proxy["ip"]),
-            ("Server Port", str(proxy["port"])),
-            ("Username",    proxy["user"]),
-            ("Password",    proxy["pass"]),
-        ]
-
-        for row_text, value in fields:
-            ok_field = _u2_fill_pref_dialog(device, row_text, value, label)
-            if not ok_field:
-                # STRICT FAIL: dung ngay, khong gat VPN
+        # 4a. PHASE 1: Dien Server IP va Server Port (luon hien thi, khong can scroll)
+        logger.info(f"{label} [4/5] Phase 1 - Dien Server IP, Server Port...")
+        for row_text, value in [("Server IP", proxy["ip"]), ("Server Port", str(proxy["port"]))]:
+            if not _u2_fill_pref_dialog(device, row_text, value, label):
                 logger.error(_err(
-                    f"{label} === CAU HINH THAT BAI tai truong '{row_text}'. "
-                    f"VM nay se KHONG duoc bat VPN. Kiem tra lai man hinh SocksDroid. ==="
+                    f"{label} === FAIL tai '{row_text}'. VM se KHONG bat VPN. ==="
                 ))
-                return False   # <-- EXIT ngay, khong chay buoc 5
+                return False
+
+        # 4b. SCROLL XUONG de tim phan Authentication (Username/Password nam nua duoi)
+        logger.info(f"{label} [4/5] Scroll xuong phan Username & Password Authentication...")
+        AUTH_SECTION = "Username & Password Authentication"
+        scrollable = device(scrollable=True)
+        if scrollable.exists:
+            # Thu scroll den thi phan Authentication truoc
+            try:
+                scrollable.scroll.to(text=AUTH_SECTION)
+                time.sleep(0.5)
+            except Exception:
+                # Fallback: swipe len (scroll xuong man hinh)
+                device.swipe(360, 900, 360, 300, duration=0.4)
+                time.sleep(0.5)
+        else:
+            # Khong co scrollable view -> swipe thu cong
+            device.swipe(360, 900, 360, 300, duration=0.4)
+            time.sleep(0.5)
+
+        # 4c. Kich hoat toggle "Username & Password Authentication" neu dang OFF
+        auth_toggle = device(text=AUTH_SECTION)
+        if auth_toggle.exists:
+            # Tim Switch / CheckBox ke ben hang nay
+            # uiautomator2: lay parent row roi tim widget con
+            auth_row = device(text=AUTH_SECTION)
+            # Tim Switch trong cung container voi text nay
+            auth_sw = device(className="android.widget.CheckBox", checked=False)
+            if not auth_sw.exists:
+                auth_sw = device(className="android.widget.Switch", checked=False)
+            # Neu tim duoc switch dang OFF -> click
+            if auth_sw.exists:
+                logger.info(f"{label} Bat 'Username & Password Authentication'...")
+                auth_sw.click()
+                time.sleep(0.5)
+            else:
+                # Co the da ON hoac la dang dung ToggleButton
+                logger.info(f"{label} 'Username & Password Authentication' co ve da ON.")
+        else:
+            # Section nay co the co ten khac hoac khong ton tai -> tiep tuc cu gan
+            logger.warning(_warn(f"{label} Khong tim thay muc '{AUTH_SECTION}' -- "
+                                 "Username/Password van duoc dien (co the tu dong hien thi)."))
+
+        # 4d. PHASE 2: Dien Username va Password (gio da scroll xuong va auth da bat)
+        logger.info(f"{label} [4/5] Phase 2 - Dien Username, Password...")
+        for row_text, value in [("Username", proxy["user"]), ("Password", proxy["pass"])]:
+            if not _u2_fill_pref_dialog(device, row_text, value, label):
+                logger.error(_err(
+                    f"{label} === FAIL tai '{row_text}'. VM se KHONG bat VPN. ==="
+                ))
+                return False
+
 
         # 5. Ca 4 truong OK -> bat VPN switch an toan
         logger.info(f"{label} [5/5] Bat VPN switch voi proxy moi...")
