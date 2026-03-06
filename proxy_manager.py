@@ -487,87 +487,119 @@ def install_app(ld_console: str, index_0: int, apk_path: str) -> bool:
 
 
 # ============================================================
-# UI Automator Helpers
+# UI Automator Helpers (SocksDroid dung PreferenceActivity)
 # ============================================================
 
 def _u2_connect(serial: str, label: str):
     """
-    Ket noi uiautomator2 den may ao.
-    uiautomator2 tu dong cai atx-agent vao device qua ADB neu chua co.
-    Khong can internet tren device -- agent duoc copy tu host machine.
+    Ket noi uiautomator2.
+    Tu dong cai atx-agent vao device qua ADB (khong can internet tren VM).
     """
     try:
         device = u2.connect(serial)
-        # Ping kiem tra ket noi
-        device.info
+        device.info   # ping kiem tra ket noi
         return device
     except Exception as exc:
         raise RuntimeError(f"{label} u2.connect({serial}) that bai: {exc}")
 
 
-def _u2_find_edittexts(device) -> list:
-    """
-    Tim tat ca EditText tren man hinh SocksDroid.
-    Tra ve list element theo thu tu xuat hien (top-to-bottom).
-    """
-    return device(className="android.widget.EditText").get()
-
-
 def _u2_find_switch(device):
-    """Tim Switch/ToggleButton chinh cua SocksDroid."""
-    # Thu theo class Switch
-    sw = device(className="android.widget.Switch")
-    if sw.exists:
-        return sw
-    # Thu theo ToggleButton
-    tb = device(className="android.widget.ToggleButton")
-    if tb.exists:
-        return tb
+    """Tim VPN toggle Switch / ToggleButton chinh cua SocksDroid."""
+    for cls in ("android.widget.Switch", "android.widget.ToggleButton"):
+        el = device(className=cls)
+        if el.exists:
+            return el
     return None
 
 
-def _u2_clear_and_type(device, element, text: str, label: str) -> bool:
-    """Tap vao truong, xoa het, go text moi."""
-    try:
-        element.click()
-        time.sleep(0.3)
-        # Chon tat ca bang CTRL+A
-        device.press("ctrl", "a")
-        time.sleep(0.1)
-        device.press("delete")
-        time.sleep(0.1)
-        # Ou dung clear_text() de dam bao sach
-        element.clear_text()
-        time.sleep(0.2)
-        element.set_text(str(text))
-        time.sleep(0.3)
-        # Dismiss keyboard
-        device.press("back")
-        time.sleep(0.2)
-        return True
-    except Exception as exc:
-        logger.warning(_warn(f"{label} Khong the dien truong: {exc}"))
+def _u2_fill_pref_dialog(device, row_text: str, value: str, label: str) -> bool:
+    """
+    Quy trinh dien mot truong Preference trong SocksDroid:
+      1. Tim hang Preference trong danh sach (vi du: 'Server IP')
+      2. Click de mo Popup Dialog
+      3. Tim duy nhat 1 EditText trong Dialog -> clear -> type -> click OK
+
+    SocksDroid dung PreferenceActivity / PreferenceFragment:
+    - Man hinh chinh la ListView chua cac hang Preference
+    - Khi click mot hang, Android hien PopupDialog voi EditText de nhap
+    - KHONG co EditText truc tiep tren man hinh chinh
+
+    Returns:
+        True neu dien thanh cong.
+        False neu bat ky buoc nao that bai (pref row khong tim thay, dialog khong
+        xuat hien, khong click duoc OK).
+    """
+    DIALOG_TIMEOUT = 4   # giay cho dialog xuat hien
+
+    # -- Buoc 1: Tim hang Preference theo text label --
+    pref_row = device(text=row_text)
+    if not pref_row.exists:
+        logger.error(_err(f"{label} FAIL: Khong tim thay hang Preference '{row_text}'. "
+                          "Kiem tra lai ten hien thi tren giao dien SocksDroid."))
         return False
+
+    pref_row.click()
+    time.sleep(0.6)
+
+    # -- Buoc 2: Cho Popup Dialog xuat hien, phai co EditText ben trong --
+    dialog_edit = device(className="android.widget.EditText", focused=True)
+    if not dialog_edit.wait(timeout=DIALOG_TIMEOUT):
+        # Thu fallback: EditText bat ky (co the khong focused ngay)
+        dialog_edit = device(className="android.widget.EditText")
+        if not dialog_edit.exists:
+            logger.error(_err(f"{label} FAIL: Dialog EditText khong xuat hien sau khi click '{row_text}'. "
+                              "App co the to ra loi hoac giao dien da thay doi."))
+            return False
+
+    # -- Buoc 3: Xoa va go gia tri moi --
+    dialog_edit.clear_text()
+    time.sleep(0.2)
+    dialog_edit.set_text(str(value))
+    time.sleep(0.3)
+
+    # -- Buoc 4: Click nut OK trong dialog --
+    ok_btn = device(text="OK")
+    if not ok_btn.exists:
+        # Mot so phien ban SocksDroid dung "Set" hoac "Apply"
+        for btn_text in ("Set", "Apply", "Luu", "Done"):
+            ok_btn = device(text=btn_text)
+            if ok_btn.exists:
+                break
+
+    if not ok_btn.exists:
+        logger.error(_err(f"{label} FAIL: Khong tim thay nut OK/Set trong dialog '{row_text}'."))
+        device.press("back")   # Dong dialog tranh ket man hinh
+        return False
+
+    ok_btn.click()
+    time.sleep(0.4)
+
+    display_val = "****" if "pass" in row_text.lower() else value
+    logger.info(_info(f"{label} [{row_text}] = {display_val}"))
+    return True
 
 
 # ============================================================
-# Configure via UI Automator
+# Configure via UI Automator  (SocksDroid PreferenceActivity)
 # ============================================================
 
 def configure_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict) -> bool:
     """
-    Cau hinh SOCKS5 proxy bang UI Automator (uiautomator2) -- 100% UI interaction.
+    Cau hinh SOCKS5 proxy bang UI Automator -- 100% UI interaction.
 
-    Quy trinh (giao dien nguoi dung thuc):
-      1. Stop SocksDroid
-      2. Start SocksDroid (man hinh chinh hien EditText fields)
-      3. Tat VPN neu dang bat (tranh loi mang khi doi IP)
-      4. Dien lan luot vao: Server, Port, Username, Password
-      5. Bat lai cong tac VPN
+    SocksDroid dung PreferenceActivity:
+      - Man hinh chinh la danh sach cac hang Preference (ListView)
+      - Moi hang co text label: 'Server IP', 'Server Port', 'Username', 'Password'
+      - Click mot hang -> mo Dialog voi 1 EditText -> nhap -> OK
 
-    Ly do khong dung XML injection:
-      Android SharedPreferences cached trong RAM; file ghi bang root bi overwrite
-      khi app khoi dong do sai owner (root vs app UID). UI input la duy nhat guaranteed.
+    Quy trinh:
+      1. Stop SocksDroid (giat sach RAM cache)
+      2. Start SocksDroid tuoi
+      3. Tat VPN switch neu dang ON
+      4. Dien 4 truong theo trinh tu: Server IP, Server Port, Username, Password
+         LUI: neu bat ky truong nao fail -> ERROR do + return False NGAY LAP TUC
+              TUYET DOI khong gat VPN neu config chua hoan tat.
+      5. Kiem tra ket qua: neu ca 4 truong OK -> bat VPN switch
     """
     port   = _adb_port(ldplayer_index)
     serial = f"127.0.0.1:{port}"
@@ -580,71 +612,84 @@ def configure_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict
         return False
 
     try:
-        # Ket noi uiautomator2 (tu dong cai atx-agent neu can)
         device = _u2_connect(serial, label)
     except RuntimeError as exc:
         logger.error(_err(str(exc)))
         return False
 
     try:
-        # 1. Stop SocksDroid hoan toan
+        # 1. Stop SocksDroid de giat sach RAM
+        logger.info(f"{label} [1/5] Stop SocksDroid...")
         device.app_stop(SOCKSDROID_PACKAGE)
-        time.sleep(0.8)
+        time.sleep(1.0)
 
         # 2. Mo SocksDroid tuoi
+        logger.info(f"{label} [2/5] Mo SocksDroid...")
         device.app_start(SOCKSDROID_PACKAGE, ".MainActivity", wait=True)
-        time.sleep(2.5)  # Cho UI load day du
+        time.sleep(2.5)
 
-        # 3. Tat VPN neu dang bat (tranh loi mang trong luc doi IP)
+        # 3. Tat VPN switch neu dang ON
+        logger.info(f"{label} [3/5] Kiem tra VPN switch...")
         vpn_switch = _u2_find_switch(device)
         if vpn_switch and vpn_switch.info.get("checked", False):
-            logger.info(f"{label} VPN dang ON -- tat truoc khi doi IP...")
+            logger.info(f"{label} VPN dang ON - tat truoc khi doi IP...")
             vpn_switch.click()
             time.sleep(1.5)
+            # Xu ly dialog "Disconnect VPN?" neu co
+            for confirm_text in ("OK", "Yes", "Disconnect"):
+                confirm = device(text=confirm_text)
+                if confirm.exists:
+                    confirm.click()
+                    time.sleep(0.5)
+                    break
 
-        # 4. Tim tat ca EditText fields va dien tham so proxy
-        #    SocksDroid MainActivity layout: [0]=Server [1]=Port [2]=Username [3]=Password
-        field_values = [
-            ("Server",   proxy["ip"]),
-            ("Port",     str(proxy["port"])),
-            ("Username", proxy["user"]),
-            ("Password", proxy["pass"]),
+        # 4. Dien 4 truong Preference -- STRICT: fail 1 truong -> DUNG NGAY, KHONG bat VPN
+        #    Label text phai khop CHINH XAC voi text hien thi tren giao dien SocksDroid
+        logger.info(f"{label} [4/5] Dien thong so proxy...")
+        fields = [
+            ("Server IP",   proxy["ip"]),
+            ("Server Port", str(proxy["port"])),
+            ("Username",    proxy["user"]),
+            ("Password",    proxy["pass"]),
         ]
 
-        for field_idx, (field_name, value) in enumerate(field_values):
-            # tim theo instance index
-            el = device(className="android.widget.EditText", instance=field_idx)
+        for row_text, value in fields:
+            ok_field = _u2_fill_pref_dialog(device, row_text, value, label)
+            if not ok_field:
+                # STRICT FAIL: dung ngay, khong gat VPN
+                logger.error(_err(
+                    f"{label} === CAU HINH THAT BAI tai truong '{row_text}'. "
+                    f"VM nay se KHONG duoc bat VPN. Kiem tra lai man hinh SocksDroid. ==="
+                ))
+                return False   # <-- EXIT ngay, khong chay buoc 5
 
-            # Neu khong tim thay theo instance, thu theo resourceId pattern
-            if not el.exists:
-                logger.warning(_warn(f"{label} Khong tim thay truong '{field_name}' (instance={field_idx})"))
-                continue
-
-            ok = _u2_clear_and_type(device, el, value, label)
-            if ok:
-                logger.info(_info(f"{label} [{field_name}] = {value if field_name != 'Password' else '****'}"))
-            else:
-                logger.warning(_warn(f"{label} Loi khi dien truong {field_name}"))
-
-        # 5. Bat cong tac VPN voi cau hinh moi
-        time.sleep(0.5)
+        # 5. Ca 4 truong OK -> bat VPN switch an toan
+        logger.info(f"{label} [5/5] Bat VPN switch voi proxy moi...")
         vpn_switch = _u2_find_switch(device)
-        if vpn_switch:
-            if not vpn_switch.info.get("checked", False):
-                vpn_switch.click()
-                time.sleep(2.0)  # Cho VPN connect
-                logger.info(_ok(f"{label} Da bat VPN voi proxy moi: {proxy['ip']}:{proxy['port']}"))
-            else:
-                logger.info(_info(f"{label} VPN da ON (co the tu bat sau khi set text)."))
-        else:
-            logger.warning(_warn(f"{label} Khong tim thay VPN switch. Kiem tra thu cong."))
+        if not vpn_switch:
+            logger.error(_err(f"{label} Khong tim thay VPN switch sau khi dien xong. "
+                              "Khong the bat VPN."))
+            return False
 
-        logger.info(_ok(f"{label} UI Automator hoan tat."))
+        vpn_switch.click()
+        time.sleep(1.5)
+
+        # Xu ly dialog VPN permission (lan dau bam OK)
+        for confirm_text in ("OK", "Connect", "Yes"):
+            confirm = device(text=confirm_text)
+            if confirm.exists:
+                logger.info(f"{label} Xu ly dialog VPN permission -- click '{confirm_text}'...")
+                confirm.click()
+                time.sleep(2.0)
+                break
+
+        logger.info(_ok(f"{label} === HOAN THANH: VPN da bat voi {proxy['ip']}:{proxy['port']} ==="))
         return True
 
     except Exception as exc:
-        logger.error(_err(f"{label} Loi UI Automator: {exc}"))
+        logger.error(_err(f"{label} Loi ngoai du kien trong UI Automator: {exc}"))
         return False
+
 
 
 def verify_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict) -> bool:
