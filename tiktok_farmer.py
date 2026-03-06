@@ -295,17 +295,58 @@ def _maybe_like(ld_console: str, index: int, cfg: dict) -> bool:
 # TikTok App Control
 # ---------------------------------------------------------------------------
 
-def _open_tiktok(ld_console: str, index: int, package: str) -> bool:
-    logger.info(f"[VM {index:02d}] Dang mo TikTok...")
+TIKTOK_FOREGROUND_TIMEOUT = 15   # Giay cho TikTok len foreground
+TIKTOK_FOREGROUND_POLL   = 2    # Tan suat check (giay)
+
+
+def _open_tiktok(ld_console: str, index: int, package: str,
+                 adb_exe: str, port: int) -> bool:
+    """
+    Mo TikTok va XAC NHAN no thuc su len foreground truoc khi farm.
+
+    Quy trinh:
+      1. Gui lenh am start
+      2. Vong lap cho toi da TIKTOK_FOREGROUND_TIMEOUT giay:
+           - Bắn: dumpsys window windows | grep mCurrentFocus
+           - Neu thay package name trong output -> THANH CONG
+      3. Neu het timeout -> ERROR do, return False -> run_session skip VM
+    """
+    label = f"[VM {index:02d}] [{package}]"
+    logger.info(f"{label} Dang mo TikTok...")
+
+    # Gui lenh am start
     cmd = f"am start -n {package}/.main.MainActivity"
-    ok, output = _adb(ld_console, index, cmd)
-    if ok:
-        load_wait = random.uniform(4.0, 7.0)
-        logger.info(f"[VM {index:02d}] TikTok da mo. Cho FYP load {load_wait:.1f}s ...")
-        time.sleep(load_wait)
-    else:
-        logger.error(f"[VM {index:02d}] Mo TikTok that bai: {output}")
-    return ok
+    _adb(ld_console, index, cmd)
+
+    # Vong lap xac nhan foreground ("Mat Than")
+    deadline = time.time() + TIKTOK_FOREGROUND_TIMEOUT
+    attempt  = 0
+    while time.time() < deadline:
+        attempt += 1
+        time.sleep(TIKTOK_FOREGROUND_POLL)
+
+        ok, out = _adb_shell(
+            adb_exe, port,
+            "dumpsys window windows | grep mCurrentFocus",
+            timeout=8,
+        )
+        if ok and package in out:
+            logger.info(
+                f"{label} XAC NHAN: TikTok dang o Foreground "
+                f"(attempt {attempt}, t={int(time.time()-deadline+TIKTOK_FOREGROUND_TIMEOUT)}s)."
+            )
+            # Cho FYP load them mot chut truoc khi bat dau farm
+            time.sleep(random.uniform(2.0, 3.5))
+            return True
+
+        logger.info(f"{label} Chua thay foreground (attempt {attempt})... [{out[:80]}]")
+
+    # Het timeout
+    logger.error(
+        f"{label} [ERROR] Khong the mo TikTok sau {TIKTOK_FOREGROUND_TIMEOUT}s. "
+        "Bo qua VM nay -- tuyet doi khong chay Swipe/Like."
+    )
+    return False
 
 
 def _kill_tiktok(ld_console: str, index: int, package: str) -> bool:
@@ -599,9 +640,10 @@ def run_session(vm: dict, proxy: dict, cfg: dict) -> dict:
         cfg:   config dict
     """
     ld_console  = cfg["_LD_CONSOLE"]
+    adb_exe     = cfg["_ADB_EXE"]
     package     = cfg["TIKTOK_PACKAGE"]
-    # Dung ldplayer_index lam index hien thi (1-based tinh tu vi tri trong running list)
     index       = vm["index"]
+    port        = _adb_port(index)
     session_sec = random.uniform(cfg["SESSION_MIN_SEC"], cfg["SESSION_MAX_SEC"])
 
     logger.info(
@@ -612,7 +654,8 @@ def run_session(vm: dict, proxy: dict, cfg: dict) -> dict:
     result = {"vm": vm["name"], "index": index, "videos_watched": 0, "likes": 0,
               "session_sec": round(session_sec), "status": "ok"}
 
-    if not _open_tiktok(ld_console, index, package):
+    # Mo TikTok + xac nhan foreground truoc khi bat dau farm
+    if not _open_tiktok(ld_console, index, package, adb_exe, port):
         result["status"] = "error_open"
         return result
 
