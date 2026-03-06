@@ -2,33 +2,23 @@
 """
 proxy_manager.py -- Task 2: Tu dong cai dat va cau hinh SocksDroid tren 10 VM LDPlayer.
 
-Luong:
-    0. _bootstrap_deps()     -- Tu kiem tra va pip install thu vien can thiet
-    1. load_config()         -- Doc config.json
-    2. load_proxies()        -- Parse data/proxies_list.txt -> list[dict]
-    3. download_apk()        -- Tu tai SocksDroid APK tu GitHub neu chua co
-    4. install_app(i)        -- ldconsole installapp -> cai APK vao VM index i
-    5. configure_proxy(i)    -- Root ADB: ghi SharedPrefs truc tiep vao /data/data/...
-    6. verify_proxy(i)       -- Root ADB: doc lai SharedPrefs, xac nhan proxy da nap
-    7. setup_all()           -- Full pipeline cho 10 VM
+ADB Connection Mode:
+    Tat ca lenh ADB dung truc tiep adb.exe qua localhost port.
+    LDPlayer port formula: VM index i (0-based) -> port = 5555 + (i * 2)
+    Vi du: TikTok_US_01 (index=0) -> 127.0.0.1:5555
+            TikTok_US_02 (index=1) -> 127.0.0.1:5557 ...
+    Ly do: ldconsole adb bridge crash voi exit code 0xC0000409 (ACCESS_VIOLATION).
 
 CLI:
-    python proxy_manager.py setup       # Tai APK (neu can) + Cai + Cau hinh + Verify
+    python proxy_manager.py setup       # Tai APK + Cai + Cau hinh + Verify
     python proxy_manager.py download    # Chi tai APK
     python proxy_manager.py install     # Chi cai APK (yeu cau APK da co)
-    python proxy_manager.py configure   # Chi cau hinh proxy (APK da duoc cai)
+    python proxy_manager.py configure   # Chi cau hinh proxy (Root ADB -> SharedPrefs)
     python proxy_manager.py verify      # Chi kiem tra trang thai proxy tren 10 VM
-
-Luu y Root ADB:
-    - May ao can duoc cau hinh voi --root 1 --adb 1 (ld_manager.py da xu ly)
-    - Lenh ADB duoc chay qua: ldconsole adb --index i --command "su -c '...'"
-    - SharedPrefs duoc ghi truc tiep vao /data/data/net.typeblog.socks/shared_prefs/
-      tranh hoan toan viec hien thi VPN permission dialog
 """
 
 # ============================================================
 # STEP 0 -- AUTO-BOOTSTRAP DEPENDENCIES
-# Phai chay truoc MOI import cua thu vien ben ngoai.
 # ============================================================
 import subprocess
 import sys
@@ -97,14 +87,8 @@ logger = logging.getLogger(__name__)
 CONFIG_FILE  = "config.json"
 PROXIES_FILE = os.path.join("data", "proxies_list.txt")
 
-# SocksDroid -- fork bndeff/socksdroid (GPL-3.0)
-# Package name cua ban fork duoc su dung:
 SOCKSDROID_PACKAGE    = "net.typeblog.socks"
 SOCKSDROID_ACTIVITY   = "net.typeblog.socks/.MainActivity"
-
-# SharedPreferences path tren may ao (yeu cau root):
-#   /data/data/<package>/shared_prefs/<prefs_file>
-# Ten file SharedPrefs duoc lay tu source code SocksDroid (net.typeblog.socks_preferences.xml)
 SOCKSDROID_PREFS_DIR  = f"/data/data/{SOCKSDROID_PACKAGE}/shared_prefs"
 SOCKSDROID_PREFS_FILE = f"{SOCKSDROID_PREFS_DIR}/{SOCKSDROID_PACKAGE}_preferences.xml"
 
@@ -112,6 +96,11 @@ SOCKSDROID_GITHUB_API   = "https://api.github.com/repos/bndeff/socksdroid/releas
 SOCKSDROID_FALLBACK_URL = (
     "https://github.com/bndeff/socksdroid/releases/download/1.0.4/socksdroid-1.0.4.apk"
 )
+
+# LDPlayer ADB port formula: port = 5555 + (ldplayer_index * 2)
+# TikTok_US_01 -> index=0 -> port 5555
+# TikTok_US_02 -> index=1 -> port 5557 ... TikTok_US_10 -> index=9 -> port 5573
+ADB_BASE_PORT = 5555
 
 INSTALL_DELAY_SEC   = 2
 CONFIGURE_DELAY_SEC = 1
@@ -124,18 +113,6 @@ def _warn(msg): return f"{Fore.YELLOW}{Style.BRIGHT}{msg}{Style.RESET_ALL}"
 def _err(msg):  return f"{Fore.RED}{Style.BRIGHT}{msg}{Style.RESET_ALL}"
 def _ok(msg):   return f"{Fore.GREEN}{Style.BRIGHT}{msg}{Style.RESET_ALL}"
 def _info(msg): return f"{Fore.CYAN}{msg}{Style.RESET_ALL}"
-
-
-def _print_root_check_warning(index: int):
-    """In canh bao neu root chua duoc bat trong may ao."""
-    print()
-    print(_warn("=" * 64))
-    print(_warn(f"  [VM {index:02d}] ROOT CHUA DUOC BAT!"))
-    print(_warn("  Chay 'python ld_manager.py configure' truoc de bat:"))
-    print(_warn("    --root 1  (bat quyen root)"))
-    print(_warn("    --adb 1   (bat ADB mang noi bo)"))
-    print(_warn("=" * 64))
-    print()
 
 
 # ============================================================
@@ -163,15 +140,12 @@ def load_config() -> dict:
         sys.exit(1)
 
     cfg["_LD_CONSOLE"] = console_path
+    cfg["_ADB_EXE"]    = _find_adb(cfg)
     return cfg
 
 
 def load_proxies(path: str = PROXIES_FILE) -> list:
-    """
-    Parse file proxy list, bo qua dong trong va comment (#).
-    Format moi dong: IP:Port:Username:Password
-    Returns: list of dict {"ip", "port", "user", "pass"}
-    """
+    """Parse file proxy list (IP:Port:User:Pass). Bo qua dong trong va comment."""
     if not os.path.isfile(path):
         logger.error(_err(f"Khong tim thay file proxy: {path}"))
         sys.exit(1)
@@ -184,15 +158,16 @@ def load_proxies(path: str = PROXIES_FILE) -> list:
                 continue
             parts = line.split(":")
             if len(parts) != 4:
-                logger.warning(_warn(f"Dong {lineno} khong dung format (IP:Port:User:Pass), bo qua: {line}"))
+                logger.warning(_warn(f"Dong {lineno} khong dung format, bo qua: {line}"))
                 continue
             ip, port_str, user, pwd = parts
             try:
                 port = int(port_str)
             except ValueError:
-                logger.warning(_warn(f"Dong {lineno}: Port khong phai so nguyen ('{port_str}'), bo qua."))
+                logger.warning(_warn(f"Dong {lineno}: Port khong hop le, bo qua."))
                 continue
-            proxies.append({"ip": ip.strip(), "port": port, "user": user.strip(), "pass": pwd.strip()})
+            proxies.append({"ip": ip.strip(), "port": port,
+                            "user": user.strip(), "pass": pwd.strip()})
 
     logger.info(_info(f"Da load {len(proxies)} proxy tu {path}"))
     return proxies
@@ -203,12 +178,7 @@ def load_proxies(path: str = PROXIES_FILE) -> list:
 # ============================================================
 
 def download_apk(apk_path: str) -> bool:
-    """
-    Tu dong tai SocksDroid APK tu GitHub neu file chua ton tai.
-    1. Goi GitHub Releases API de lay URL APK ban moi nhat.
-    2. Fallback ve URL hardcoded (v1.0.4) neu API loi.
-    3. Streaming download voi progress bar.
-    """
+    """Tu dong tai SocksDroid APK tu GitHub neu file chua ton tai."""
     abs_path = os.path.abspath(apk_path)
     if os.path.isfile(abs_path):
         size_mb = os.path.getsize(abs_path) / (1024 * 1024)
@@ -234,7 +204,8 @@ def download_apk(apk_path: str) -> bool:
                             pct = downloaded / total * 100
                             if int(pct) % 10 == 0 and pct > 0:
                                 bar = "#" * int(pct // 5) + "-" * (20 - int(pct // 5))
-                                print(f"\r  [{bar}] {pct:.0f}%  ({downloaded/1024/1024:.1f}/{total/1024/1024:.1f} MB)",
+                                print(f"\r  [{bar}] {pct:.0f}%  "
+                                      f"({downloaded/1024/1024:.1f}/{total/1024/1024:.1f} MB)",
                                       end="", flush=True)
             print()
         size_mb = os.path.getsize(abs_path) / (1024 * 1024)
@@ -268,18 +239,138 @@ def _resolve_apk_url() -> str:
 
 
 # ============================================================
-# Core LDConsole Wrapper
+# Direct ADB Helpers (thay the ldconsole adb bridge)
+# ============================================================
+
+def _find_adb(cfg: dict) -> str:
+    """
+    Tim duong dan den adb.exe.
+    Thu tu uu tien:
+      1. {LDPLAYER_PATH}/adb.exe  -- adb.exe di kem LDPlayer
+      2. "adb"                    -- adb da co trong system PATH
+    """
+    candidate = os.path.join(cfg["LDPLAYER_PATH"], "adb.exe")
+    if os.path.isfile(candidate):
+        logger.info(_info(f"Dung ADB tai: {candidate}"))
+        return candidate
+
+    # Thu system PATH
+    try:
+        result = subprocess.run(["adb", "version"], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            logger.info(_info("Dung ADB tu system PATH"))
+            return "adb"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    logger.error(_err(
+        f"Khong tim thay adb.exe. Da thu: {candidate} va system PATH.\n"
+        "Hay cai Android SDK Platform-Tools hoac dat LDPLAYER_PATH chinh xac trong config.json."
+    ))
+    sys.exit(1)
+
+
+def _adb_port(vm_number: int) -> int:
+    """
+    Tinh port ADB cho VM thu vm_number (1-based).
+    LDPlayer index = vm_number - 1 (0-based).
+    Port = 5555 + (ldplayer_index * 2).
+
+    TikTok_US_01 (index=0) -> 5555
+    TikTok_US_02 (index=1) -> 5557
+    ...
+    TikTok_US_10 (index=9) -> 5573
+    """
+    return ADB_BASE_PORT + ((vm_number - 1) * 2)
+
+
+def _adb_connect(adb_exe: str, port: int) -> bool:
+    """
+    Ket noi ADB den may ao qua localhost:<port>.
+    Returns True neu ket noi thanh cong hoac da ket noi truoc do.
+    """
+    try:
+        result = subprocess.run(
+            [adb_exe, "connect", f"127.0.0.1:{port}"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
+        )
+        output = (result.stdout + result.stderr).strip()
+        if "connected" in output.lower() or "already" in output.lower():
+            return True
+        logger.warning(_warn(f"ADB connect 127.0.0.1:{port}: {output}"))
+        return False
+    except subprocess.TimeoutExpired:
+        logger.error(_err(f"ADB connect timeout: port {port}"))
+        return False
+    except FileNotFoundError:
+        logger.error(_err(f"Khong tim thay adb.exe: {adb_exe}"))
+        return False
+
+
+def _adb_shell_su(adb_exe: str, port: int, shell_cmd: str, timeout: int = 30) -> tuple:
+    """
+    Chay lenh shell voi quyen root tren may ao qua ADB truc tiep.
+    Lenh: adb -s 127.0.0.1:<port> shell su -c '<shell_cmd>'
+
+    Returns: (success: bool, output: str)
+    """
+    serial = f"127.0.0.1:{port}"
+    # Wrap shell_cmd trong dau ngoac kep de su -c xu ly dung
+    full_cmd = [adb_exe, "-s", serial, "shell", "su", "-c", shell_cmd]
+    try:
+        result = subprocess.run(
+            full_cmd,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=timeout,
+        )
+        output = (result.stdout + result.stderr).strip()
+        # su loi thu'ong tra ve exit code != 0 hoac co "Permission denied"
+        if result.returncode != 0 or "Permission denied" in output:
+            logger.warning(_warn(f"[{serial}] su -c that bai (rc={result.returncode}): {output[:120]}"))
+            return False, output
+        return True, output
+    except subprocess.TimeoutExpired:
+        logger.error(_err(f"[{serial}] ADB su timeout: {shell_cmd[:60]}"))
+        return False, "TIMEOUT"
+    except Exception as exc:
+        logger.error(_err(f"[{serial}] ADB exception: {exc}"))
+        return False, str(exc)
+
+
+def _adb_shell(adb_exe: str, port: int, shell_cmd: str, timeout: int = 30) -> tuple:
+    """Chay lenh shell khong can root (cho install, isrunning...). Returns (success, output)."""
+    serial = f"127.0.0.1:{port}"
+    full_cmd = [adb_exe, "-s", serial, "shell", shell_cmd]
+    try:
+        result = subprocess.run(
+            full_cmd,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=timeout,
+        )
+        output = (result.stdout + result.stderr).strip()
+        return result.returncode == 0, output
+    except subprocess.TimeoutExpired:
+        return False, "TIMEOUT"
+    except Exception as exc:
+        return False, str(exc)
+
+
+# ============================================================
+# LDConsole Wrapper (chi dung cho: install, isrunning, list)
 # ============================================================
 
 def _ld_command(ld_console: str, *args) -> tuple:
-    """Goi ldconsole.exe. Returns (success: bool, output: str)."""
+    """Goi ldconsole.exe cho cac tac vu KHONG phai ADB shell. Returns (success, output)."""
     cmd = [ld_console] + list(args)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=120)
+                                encoding="utf-8", errors="replace", timeout=60)
         output = (result.stdout + result.stderr).strip()
         if result.returncode != 0:
-            logger.warning(_warn(f"ldconsole exit {result.returncode}: {output[:120]}"))
+            logger.warning(_warn(f"ldconsole exit {result.returncode}: {output[:80]}"))
             return False, output
         return True, output
     except subprocess.TimeoutExpired:
@@ -290,41 +381,19 @@ def _ld_command(ld_console: str, *args) -> tuple:
         return False, str(exc)
 
 
-def _adb_su(ld_console: str, index: int, shell_cmd: str) -> tuple:
-    """
-    Chay lenh ADB voi quyen root (su -c) qua ldconsole bridge.
-
-    Ky thuat: ldconsole adb --index i --command "su -c '<shell_cmd>'"
-    Yeu cau:  may ao da duoc cau hinh --root 1 --adb 1 (ld_manager.py).
-
-    Returns: (success: bool, output: str)
-    """
-    # Dung dau ngoac kep ben ngoai, dau phay don ben trong su -c
-    adb_cmd = f"su -c '{shell_cmd}'"
-    return _ld_command(ld_console, "adb", "--index", str(index), "--command", adb_cmd)
-
-
 def _is_running(ld_console: str, index: int) -> bool:
-    """Kiem tra VM index co dang chay khong."""
+    """Kiem tra VM (0-based index) co dang chay khong."""
     ok, output = _ld_command(ld_console, "isrunning", "--index", str(index))
     return ok and "running" in output.lower()
 
 
 # ============================================================
-# SharedPrefs XML builder
+# SharedPrefs XML Builder
 # ============================================================
 
 def _build_prefs_xml(proxy: dict) -> str:
-    """
-    Tao noi dung file SharedPreferences XML cho SocksDroid.
-
-    Key names duoc lay tu source code cua bndeff/socksdroid:
-      proxy_server   -> IP/hostname cua SOCKS5 server
-      proxy_port     -> Port (luu la string trong SharedPrefs)
-      proxy_username -> Username xac thuc
-      proxy_password -> Password xac thuc
-    """
-    xml = (
+    """Tao noi dung SharedPreferences XML cho SocksDroid."""
+    return (
         "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>"
         "<map>"
         f"<string name=\"proxy_server\">{proxy['ip']}</string>"
@@ -336,137 +405,158 @@ def _build_prefs_xml(proxy: dict) -> str:
         "<boolean name=\"per_app\" value=\"false\" />"
         "</map>"
     )
-    return xml
 
 
 # ============================================================
 # Install, Configure, Verify
 # ============================================================
 
-def install_app(ld_console: str, index: int, apk_path: str) -> bool:
-    """Cai APK SocksDroid vao VM index qua ldconsole installapp."""
+def install_app(ld_console: str, index_0: int, apk_path: str) -> bool:
+    """Cai APK SocksDroid vao VM (0-based index) qua ldconsole installapp."""
     abs_apk = os.path.abspath(apk_path)
     if not os.path.isfile(abs_apk):
-        logger.error(_err(f"[VM {index:02d}] APK khong ton tai: {abs_apk}"))
+        logger.error(_err(f"[VM {index_0+1:02d}] APK khong ton tai: {abs_apk}"))
         return False
 
-    if not _is_running(ld_console, index):
-        logger.warning(_warn(f"[VM {index:02d}] VM chua chay -- bo qua install."))
+    if not _is_running(ld_console, index_0):
+        logger.warning(_warn(f"[VM {index_0+1:02d}] VM chua chay -- bo qua install."))
         return False
 
-    logger.info(f"[VM {index:02d}] Dang cai SocksDroid APK ...")
-    ok, output = _ld_command(ld_console, "installapp", "--index", str(index), "--filename", abs_apk)
+    logger.info(f"[VM {index_0+1:02d}] Dang cai SocksDroid APK ...")
+    ok, output = _ld_command(ld_console, "installapp",
+                             "--index", str(index_0), "--filename", abs_apk)
     if ok:
-        logger.info(_ok(f"[VM {index:02d}] Cai APK thanh cong."))
+        logger.info(_ok(f"[VM {index_0+1:02d}] Cai APK thanh cong."))
     else:
-        logger.error(_err(f"[VM {index:02d}] Cai APK that bai: {output}"))
+        logger.error(_err(f"[VM {index_0+1:02d}] Cai APK that bai: {output}"))
     return ok
 
 
-def configure_proxy(ld_console: str, index: int, proxy: dict) -> bool:
+def configure_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
     """
-    Ghi cau hinh proxy SOCKS5 truc tiep vao SharedPreferences cua SocksDroid
-    bang quyen root (su -c), sau do khoi dong app.
+    Ghi cau hinh SOCKS5 proxy truc tiep vao SharedPreferences cua SocksDroid
+    bang kiet noi ADB goc qua port localhost, chay lenh voi su -c (root).
 
-    Quy trinh Root ADB:
-      1. Force-stop SocksDroid (dam bao app khong lock file)
-      2. Tao thu muc SharedPrefs neu chua co
-      3. Ghi XML SharedPrefs bang: su -c "echo '<xml>' > /data/data/.../prefs.xml"
-      4. Set quyen file (660) va owner dung voi package
-      5. Khoi dong SocksDroid: su -c "am start -n ..."
-
-    KHONG co VPN permission dialog vi app duoc khoi dong bang root.
+    Port: 5555 + ((vm_number - 1) * 2)
+    Quy trinh:
+      1. adb connect 127.0.0.1:<port>
+      2. su -c force-stop SocksDroid
+      3. su -c mkdir SharedPrefs dir
+      4. su -c ghi XML file bang printf
+      5. su -c chmod 660 + chown
+      6. su -c am start SocksDroid
     """
-    if not _is_running(ld_console, index):
-        logger.warning(_warn(f"[VM {index:02d}] VM chua chay -- bo qua configure."))
+    port   = _adb_port(vm_number)
+    serial = f"127.0.0.1:{port}"
+    label  = f"[VM {vm_number:02d}] [{serial}]"
+
+    logger.info(f"{label} Dang cau hinh proxy -> {proxy['ip']}:{proxy['port']} ...")
+
+    # 1. Ket noi ADB
+    if not _adb_connect(adb_exe, port):
+        logger.error(_err(f"{label} Khong the ket noi ADB. VM co the chua chay hoac ADB chua bat."))
         return False
 
-    logger.info(f"[VM {index:02d}] Dang cau hinh proxy -> {proxy['ip']}:{proxy['port']} (user: {proxy['user']}) ...")
+    # 2. Force-stop SocksDroid truoc khi ghi file
+    _adb_shell_su(adb_exe, port, f"am force-stop {SOCKSDROID_PACKAGE}")
+    time.sleep(0.4)
 
-    # 1. Force-stop SocksDroid truoc khi ghi file
-    _adb_su(ld_console, index, f"am force-stop {SOCKSDROID_PACKAGE}")
-    time.sleep(0.5)
+    # 3. Tao thu muc SharedPrefs
+    _adb_shell_su(adb_exe, port, f"mkdir -p {SOCKSDROID_PREFS_DIR}")
 
-    # 2. Tao thu muc SharedPrefs
-    _adb_su(ld_console, index, f"mkdir -p {SOCKSDROID_PREFS_DIR}")
+    # 4. Ghi XML SharedPrefs bang printf (an toan voi cac ky tu dac biet trong password)
+    ip   = proxy["ip"].replace("'", "\\'").replace('"', '\\"')
+    port_str = str(proxy["port"])
+    user = proxy["user"].replace("'", "\\'").replace('"', '\\"')
+    pwd  = proxy["pass"].replace("'", "\\'").replace('"', '\\"')
 
-    # 3. Build va ghi XML SharedPrefs
-    xml_content = _build_prefs_xml(proxy)
-    # Dung printf de tranh van de escape voi cac ky tu dac biet trong password
-    # Thay the kep don trong proxy fields bang \' de tranh break su -c shell
-    ip   = proxy["ip"].replace("'", "\\'")
-    port = str(proxy["port"])
-    user = proxy["user"].replace("'", "\\'")
-    pwd  = proxy["pass"].replace("'", "\\'")
-
+    xml_content = (
+        "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>"
+        "<map>"
+        f"<string name='proxy_server'>{ip}</string>"
+        f"<string name='proxy_port'>{port_str}</string>"
+        f"<string name='proxy_username'>{user}</string>"
+        f"<string name='proxy_password'>{pwd}</string>"
+        "<boolean name='ipv6' value='false' />"
+        "<boolean name='udp_forward' value='false' />"
+        "<boolean name='per_app' value='false' />"
+        "</map>"
+    )
+    # Dung printf voi echo de tranh van de xuong dong
+    write_cmd = f"echo {repr(xml_content)} > {SOCKSDROID_PREFS_FILE}"
+    # Su dung cat heredoc thay vi echo de an toan hon
     write_cmd = (
         f"printf '%s' "
-        f"'<?xml version=\\'1.0\\' encoding=\\'utf-8\\' standalone=\\'yes\\' ?>"
-        f"<map>"
-        f"<string name=\\'proxy_server\\'>{ip}</string>"
-        f"<string name=\\'proxy_port\\'>{port}</string>"
-        f"<string name=\\'proxy_username\\'>{user}</string>"
-        f"<string name=\\'proxy_password\\'>{pwd}</string>"
-        f"<boolean name=\\'ipv6\\' value=\\'false\\' />"
-        f"<boolean name=\\'udp_forward\\' value=\\'false\\' />"
-        f"<boolean name=\\'per_app\\' value=\\'false\\' />"
-        f"</map>' > {SOCKSDROID_PREFS_FILE}"
+        f'"{xml_content.replace(chr(34), chr(92)+chr(34))}" '
+        f"> {SOCKSDROID_PREFS_FILE}"
     )
-    ok_write, out_write = _adb_su(ld_console, index, write_cmd)
+    ok_write, out_write = _adb_shell_su(adb_exe, port, write_cmd)
     if not ok_write:
-        logger.error(_err(f"[VM {index:02d}] Ghi SharedPrefs that bai: {out_write}"))
-        _print_root_check_warning(index)
-        return False
+        # Thu cach viet don gian hon: dung cat voi stdin
+        # Tao XML khong co dau ngoac kep ben trong de de escape
+        simple_write = (
+            f"echo \"<?xml version='1.0' encoding='utf-8' standalone='yes' ?>"
+            f"<map>"
+            f"<string name='proxy_server'>{ip}</string>"
+            f"<string name='proxy_port'>{port_str}</string>"
+            f"<string name='proxy_username'>{user}</string>"
+            f"<string name='proxy_password'>{pwd}</string>"
+            f"</map>\" > {SOCKSDROID_PREFS_FILE}"
+        )
+        ok_write, out_write = _adb_shell_su(adb_exe, port, simple_write)
+        if not ok_write:
+            logger.error(_err(f"{label} Ghi SharedPrefs that bai: {out_write[:120]}"))
+            logger.error(_err(f"{label} Kiem tra: 1) Root da bat chua? 2) ADB daemon chay chua? 3) Dung port {port}?"))
+            return False
 
-    # 4. Set quyen file phu hop voi package (660) va owner = package uid
-    _adb_su(ld_console, index, f"chmod 660 {SOCKSDROID_PREFS_FILE}")
-    # Lay uid cua package va doi owner
-    _adb_su(ld_console, index,
-            f"chown $(stat -c '%U:%G' {SOCKSDROID_PREFS_DIR}) {SOCKSDROID_PREFS_FILE}")
+    # 5. Set quyen file va owner
+    _adb_shell_su(adb_exe, port, f"chmod 660 {SOCKSDROID_PREFS_FILE}")
+    # Lay owner cua thu muc package va gan cho file prefs
+    _adb_shell_su(adb_exe, port,
+                  f"chown $(stat -c '%u:%g' {SOCKSDROID_PREFS_DIR}) {SOCKSDROID_PREFS_FILE}")
 
-    # 5. Khoi dong SocksDroid voi root (khong co VPN dialog)
-    start_cmd = f"am start -n {SOCKSDROID_ACTIVITY} --ez intent_start true"
-    ok_start, out_start = _adb_su(ld_console, index, start_cmd)
-    if not ok_start:
-        logger.warning(_warn(f"[VM {index:02d}] Am start that bai: {out_start}"))
+    # 6. Khoi dong SocksDroid
+    ok_start, _ = _adb_shell_su(adb_exe, port,
+                                 f"am start -n {SOCKSDROID_ACTIVITY} --ez intent_start true")
+    if ok_start:
+        logger.info(_ok(f"{label} Cau hinh proxy va khoi dong SocksDroid thanh cong."))
     else:
-        logger.info(_ok(f"[VM {index:02d}] Cau hinh proxy va khoi dong SocksDroid thanh cong."))
+        logger.warning(_warn(f"{label} Ghi SharedPrefs OK nhung am start that bai. Kiem tra thu cong."))
 
-    return ok_write  # Thanh cong neu it nhat ghi duoc SharedPrefs
+    return True  # Thanh cong neu ghi duoc SharedPrefs
 
 
-def verify_proxy(ld_console: str, index: int, proxy: dict) -> bool:
+def verify_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
     """
-    Kiem tra xem proxy da thuc su duoc nap vao SocksDroid chua.
-
-    Phuong phap: Doc lai file SharedPreferences bang root va kiem tra
-    xem IP va Port trong file co khop voi proxy du kien khong.
-
-    Returns:
-        True  -- SharedPrefs ton tai va chua dung IP:Port mong muon
-        False -- File khong ton tai, rong, hoac chua sai gia tri
+    Xac minh proxy da duoc nap vao SocksDroid bang cach doc lai SharedPrefs.
+    Returns True neu IP + Port co mat trong file.
     """
-    logger.info(f"[VM {index:02d}] Dang xac minh proxy da nap ({proxy['ip']}:{proxy['port']}) ...")
+    port   = _adb_port(vm_number)
+    serial = f"127.0.0.1:{port}"
+    label  = f"[VM {vm_number:02d}] [{serial}]"
 
-    ok, output = _adb_su(ld_console, index, f"cat {SOCKSDROID_PREFS_FILE} 2>/dev/null")
+    logger.info(f"{label} Dang xac minh proxy ({proxy['ip']}:{proxy['port']}) ...")
 
-    if not ok or not output.strip():
-        logger.error(_err(
-            f"[VM {index:02d}] VERIFY FAIL: Khong doc duoc SharedPrefs. "
-            f"Root chua hoat dong hoac file chua duoc ghi."
-        ))
+    if not _adb_connect(adb_exe, port):
+        logger.error(_err(f"{label} VERIFY FAIL: Khong the ket noi ADB."))
         return False
 
-    # Kiem tra IP va Port trong noi dung XML
+    ok, output = _adb_shell_su(adb_exe, port,
+                                f"cat {SOCKSDROID_PREFS_FILE} 2>/dev/null")
+    if not ok or not output.strip():
+        logger.error(_err(f"{label} VERIFY FAIL: Khong doc duoc SharedPrefs. "
+                          f"Root chua hoat dong hoac file chua duoc ghi."))
+        return False
+
     ip_ok   = proxy["ip"]   in output
     port_ok = str(proxy["port"]) in output
 
     if ip_ok and port_ok:
-        logger.info(_ok(f"[VM {index:02d}] VERIFY OK: {proxy['ip']}:{proxy['port']} da co mat trong SharedPrefs."))
+        logger.info(_ok(f"{label} VERIFY OK: {proxy['ip']}:{proxy['port']} da co trong SharedPrefs."))
         return True
     else:
         logger.error(_err(
-            f"[VM {index:02d}] VERIFY FAIL: IP_found={ip_ok}, Port_found={port_ok}. "
+            f"{label} VERIFY FAIL: IP_found={ip_ok}, Port_found={port_ok}.\n"
             f"SharedPrefs hien tai: {output[:200]}"
         ))
         return False
@@ -488,7 +578,7 @@ def install_all(cfg: dict, proxies: list) -> None:
 
     success, failed = 0, 0
     for i in range(1, count + 1):
-        ok = install_app(ld_console, i, apk_path)
+        ok = install_app(ld_console, i - 1, apk_path)  # 0-based index
         if ok:
             success += 1
         else:
@@ -500,22 +590,23 @@ def install_all(cfg: dict, proxies: list) -> None:
 
 
 def configure_all(cfg: dict, proxies: list) -> None:
-    """Cau hinh proxy cho tat ca VM, ghep proxy[i-1] voi VM index i."""
-    ld_console = cfg["_LD_CONSOLE"]
-    count      = cfg["INSTANCE_COUNT"]
+    """Cau hinh SOCKS5 proxy cho tat ca VM qua Direct ADB."""
+    adb_exe = cfg["_ADB_EXE"]
+    count   = cfg["INSTANCE_COUNT"]
 
     if len(proxies) < count:
         logger.error(_err(f"Can {count} proxy, hien co {len(proxies)}. Kiem tra {PROXIES_FILE}."))
         sys.exit(1)
 
     print(_info("=" * 64))
-    print(_info(f"  BAT DAU: Cau hinh proxy (Root ADB -> SharedPrefs) cho {count} VM ..."))
+    print(_info(f"  BAT DAU: Cau hinh proxy (Direct ADB su -c) cho {count} VM ..."))
+    print(_info(f"  Port range: {_adb_port(1)} -- {_adb_port(count)}"))
     print(_info("=" * 64))
 
     success, failed = 0, 0
     for i in range(1, count + 1):
         proxy = proxies[i - 1]
-        ok    = configure_proxy(ld_console, i, proxy)
+        ok    = configure_proxy(adb_exe, i, proxy)
         if ok:
             success += 1
         else:
@@ -529,8 +620,8 @@ def configure_all(cfg: dict, proxies: list) -> None:
 
 def verify_all(cfg: dict, proxies: list) -> dict:
     """Xac minh proxy da duoc nap tren tat ca VM. Tra ve dict ket qua."""
-    ld_console = cfg["_LD_CONSOLE"]
-    count      = cfg["INSTANCE_COUNT"]
+    adb_exe = cfg["_ADB_EXE"]
+    count   = cfg["INSTANCE_COUNT"]
 
     if len(proxies) < count:
         logger.error(_err(f"Can {count} proxy de verify."))
@@ -542,40 +633,38 @@ def verify_all(cfg: dict, proxies: list) -> dict:
 
     results = {}
     for i in range(1, count + 1):
-        ok = verify_proxy(ld_console, i, proxies[i - 1])
+        ok = verify_proxy(adb_exe, i, proxies[i - 1])
         results[f"TikTok_US_{i:02d}"] = "OK" if ok else "FAIL"
 
     ok_count   = sum(1 for v in results.values() if v == "OK")
     fail_count = count - ok_count
-    summary    = f"VERIFY XONG: {ok_count} OK / {fail_count} FAIL / {count} tong"
-    logger.info(_ok(summary) if fail_count == 0 else _warn(summary))
+    logger.info(_ok(f"VERIFY XONG: {ok_count} OK / {fail_count} FAIL / {count} tong")
+                if fail_count == 0 else
+                _warn(f"VERIFY XONG: {ok_count} OK / {fail_count} FAIL / {count} tong"))
 
-    # In bang ket qua
     print()
-    print(f"  {'VM':<20} {'Proxy':<30} {'Status'}")
-    print("  " + "-" * 60)
+    print(f"  {'VM':<20} {'Port':<8} {'Proxy':<35} {'Status'}")
+    print("  " + "-" * 72)
     for i in range(1, count + 1):
         name   = f"TikTok_US_{i:02d}"
         proxy  = proxies[i - 1]
+        port   = _adb_port(i)
         status = results[name]
         color  = _ok(status) if status == "OK" else _err(status)
-        print(f"  {name:<20} {proxy['ip']}:{proxy['port']:<21} {color}")
+        print(f"  {name:<20} {port:<8} {proxy['ip']}:{proxy['port']:<26} {color}")
     print()
     return results
 
 
 def setup_all(cfg: dict, proxies: list) -> None:
-    """Full pipeline: Tai APK (neu can) -> Cai -> Cau hinh -> Verify cho 10 VM."""
-    # Buoc 0: Dam bao APK da san sang
+    """Full pipeline: Tai APK -> Cai -> Cau hinh -> Verify cho 10 VM."""
     apk_path = cfg["SOCKSDROID_APK_PATH"]
     if not download_apk(apk_path):
-        logger.error(_err("Khong the tai APK. Kiem tra ket noi mang hoac tai thu cong."))
+        logger.error(_err("Khong the tai APK."))
         sys.exit(1)
 
     install_all(cfg, proxies)
     configure_all(cfg, proxies)
-
-    # Cho SocksDroid khoi dong hoan toan truoc khi verify
     logger.info("Cho SocksDroid khoi dong (5s) ...")
     time.sleep(5)
     verify_all(cfg, proxies)
@@ -589,10 +678,10 @@ def main():
     valid_commands = ("setup", "download", "install", "configure", "verify")
     if len(sys.argv) < 2 or sys.argv[1] not in valid_commands:
         print(f"\n{_info('Cach dung:')} python {os.path.basename(__file__)} <command>\n")
-        print(f"  {Fore.CYAN}setup{Style.RESET_ALL}      -- Tai APK + Cai + Cau hinh (Root ADB) + Verify")
+        print(f"  {Fore.CYAN}setup{Style.RESET_ALL}      -- Tai APK + Cai + Cau hinh (Direct ADB) + Verify")
         print(f"  {Fore.CYAN}download{Style.RESET_ALL}   -- Chi tai APK SocksDroid tu GitHub")
         print(f"  {Fore.CYAN}install{Style.RESET_ALL}    -- Chi cai APK vao tat ca VM dang chay")
-        print(f"  {Fore.CYAN}configure{Style.RESET_ALL}  -- Chi ghi SharedPrefs proxy qua Root ADB")
+        print(f"  {Fore.CYAN}configure{Style.RESET_ALL}  -- Chi ghi SharedPrefs proxy (Direct ADB su -c)")
         print(f"  {Fore.CYAN}verify{Style.RESET_ALL}     -- Kiem tra proxy da duoc nap thanh cong\n")
         sys.exit(1)
 
