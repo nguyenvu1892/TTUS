@@ -671,47 +671,58 @@ def configure_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict
             time.sleep(0.5)
 
         # 4c. Kich hoat "Username & Password Authentication" neu chua tick
-        #    CheckBoxPreference: ban than hang preference la checkable element.
-        #    Kiem tra .info['checked'] tren chinh hang do, KHONG tim checkbox con bat ky.
-        auth_row = device(text=AUTH_SECTION)
-        if auth_row.exists:
-            auth_info = auth_row.info
-            is_checked = auth_info.get("checked", None)
+        #    strategy: tim CheckBox widget NAM BEN PHAI text label (khong doc tu TextView)
+        #    Vi Android: thuoc tinh "checked" chi ton tai tren node CheckBox, khong co tren TextView.
+        auth_text = device(text=AUTH_SECTION)
+        if auth_text.exists:
+            # Strategy 1: Tim CheckBox nam ben phai text label (sibling phai)
+            auth_cb = auth_text.right(className="android.widget.CheckBox")
 
-            if is_checked is False:
-                # Chua duoc tick -> click DE BAT
-                logger.info(f"{label} [AUTH] 'Username & Password Authentication' dang OFF. Bat len...")
-                auth_row.click()
-                time.sleep(0.6)   # Cho UI mo khoa 2 o Username/Password ben duoi
-                # Xac nhan lai da bat chua
-                new_checked = device(text=AUTH_SECTION).info.get("checked", None)
-                if new_checked is False:
-                    logger.error(_err(f"{label} [AUTH] Van khong the bat Authentication. "
-                                      "VM se KHONG duoc bat VPN."))
-                    return False
-                logger.info(_ok(f"{label} [AUTH] Da bat thanh cong -- Username/Password fields da mo."))
+            # Strategy 2: Fallback - bat ky CheckBox nao tren man hinh (sau khi scroll)
+            if not auth_cb or not auth_cb.exists:
+                logger.warning(_warn(f"{label} [AUTH] .right() khong tim thay CheckBox, "
+                                      "thu voi bat ky CheckBox tren man hinh..."))
+                auth_cb = device(className="android.widget.CheckBox")
 
-            elif is_checked is True:
-                logger.info(f"{label} [AUTH] 'Username & Password Authentication' da ON, bo qua.")
+            if auth_cb and auth_cb.exists:
+                cb_info    = auth_cb.info
+                is_checked = cb_info.get("checked", False)
 
-            else:
-                # 'checked' key khong co trong info (co the la Switch hoac view khac)
-                # Fallback: tim con truc tiep la CheckBox trong cung container
-                auth_cb = auth_row.child(className="android.widget.CheckBox")
-                if auth_cb.exists:
-                    if not auth_cb.info.get("checked", True):
-                        logger.info(f"{label} [AUTH] Tim thay CheckBox con dang OFF. Bat len...")
-                        auth_cb.click()
-                        time.sleep(0.6)
+                if not is_checked:
+                    logger.info(f"{label} [AUTH] CheckBox dang OFF -- click de bat...")
+                    auth_cb.click()
+                    time.sleep(1.0)   # Cho UI unlock Username/Password fields
+
+                    # Verify: doc lai tu chinh CheckBox node
+                    new_checked = auth_cb.info.get("checked", False)
+                    if not new_checked:
+                        # Strategy 3: click theo toa do trung tam CheckBox
+                        bounds = cb_info.get("bounds", {})
+                        if bounds:
+                            cx = (bounds["left"] + bounds["right"]) // 2
+                            cy = (bounds["top"]  + bounds["bottom"]) // 2
+                            logger.warning(_warn(f"{label} [AUTH] click() that bai, "
+                                                  f"thu click toa do ({cx},{cy})..."))
+                            device.click(cx, cy)
+                            time.sleep(1.0)
+                            new_checked = auth_cb.info.get("checked", False)
+
+                    if not new_checked:
+                        logger.error(_err(f"{label} [AUTH] Khong the bat CheckBox sau 3 strategy. "
+                                          "VM se KHONG duoc bat VPN."))
+                        return False
+
+                    logger.info(_ok(f"{label} [AUTH] Da bat thanh cong -- "
+                                    "Username/Password fields da mo."))
                 else:
-                    # Khong xac dinh duoc trang thai -- click row de dam bao bat
-                    logger.warning(_warn(f"{label} [AUTH] Khong xac dinh duoc 'checked' state. "
-                                         "Click de dam bao bat..."))
-                    auth_row.click()
-                    time.sleep(0.6)
+                    logger.info(f"{label} [AUTH] CheckBox da ON, bo qua.")
+            else:
+                logger.warning(_warn(f"{label} [AUTH] Khong tim thay CheckBox nao tren man hinh. "
+                                      "Thu dien Username/Password truc tiep..."))
         else:
-            logger.warning(_warn(f"{label} Khong tim thay muc '{AUTH_SECTION}' tren man hinh. "
+            logger.warning(_warn(f"{label} [AUTH] Khong tim thay muc '{AUTH_SECTION}'. "
                                   "Thu dien Username/Password truc tiep..."))
+
 
 
         # 4d. PHASE 2: Dien Username va Password (gio da scroll xuong va auth da bat)
