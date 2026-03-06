@@ -292,6 +292,78 @@ def _maybe_like(ld_console: str, index: int, cfg: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# TikTok Onboarding Handler
+# ---------------------------------------------------------------------------
+
+ONBOARDING_ELEMENT_TIMEOUT = 3   # Giay cho moi element (ngan de tiet kiem thoi gian)
+
+# Cac text button can tu dong click khi Onboarding
+_ONBOARDING_CLICK_TEXTS = [
+    "Agree and continue",       # Terms of Service (EN)
+    "Dong y va tiep tuc",       # Terms of Service (VI fallback)
+    "Skip",                     # Bo qua man hinh so thich
+    "Allow",                    # Cap quyen notification
+    "Continue",                 # Man hinh gioi thieu
+    "OK",                       # Dialog thong bao
+    "Not now",                  # Popup upsell
+]
+
+
+def handle_onboarding(adb_exe: str, port: int, index: int) -> None:
+    """
+    Xu ly nhanh cac man hinh Onboarding / Tutorial cua TikTok.
+
+    Chien thuat Short-circuit:
+      - Moi element chi doi toi da ONBOARDING_ELEMENT_TIMEOUT giay
+      - Neu khong tim thay -> skip (khong raise Exception)
+      - VM da qua Onboarding: toan bo ham mat < 4s
+      - VM moi lan dau: mat 8-15s tuy so man hinh xuat hien
+
+    Ket thuc: Thuc hien 1 Swipe Up de xoa bo Tutorial Overlay neu con ton tai.
+    """
+    import importlib
+    try:
+        u2 = importlib.import_module("uiautomator2")
+    except ImportError:
+        logger.warning(f"[VM {index:02d}] uiautomator2 chua duoc cai -- bo qua Onboarding handler.")
+        return
+
+    serial = f"127.0.0.1:{port}"
+    try:
+        d = u2.connect(serial)
+        d.implicitly_wait(ONBOARDING_ELEMENT_TIMEOUT)
+    except Exception as exc:
+        logger.warning(f"[VM {index:02d}] Khong ket noi uiautomator2 (port={port}): {exc}")
+        return
+
+    logger.info(f"[VM {index:02d}] Bat dau xu ly Onboarding (timeout={ONBOARDING_ELEMENT_TIMEOUT}s/element)...")
+
+    # -- Click cac nut Onboarding --
+    for text in _ONBOARDING_CLICK_TEXTS:
+        try:
+            el = d(text=text)
+            if el.exists(timeout=ONBOARDING_ELEMENT_TIMEOUT):
+                el.click()
+                logger.info(f"[VM {index:02d}] Onboarding: clicked '{text}'")
+                time.sleep(0.8)   # Cho animation transition
+        except Exception:
+            pass   # Element khong xuat hien, bo qua
+
+    # -- Swipe Up cuoi cung: xoa bo Tutorial Overlay neu co --
+    try:
+        W = 720
+        H = 1280
+        # Swipe tu 75% man hinh len 30% (giong nguoi that vuot xem video)
+        d.swipe(W // 2, int(H * 0.75), W // 2, int(H * 0.30), duration=0.5)
+        logger.info(f"[VM {index:02d}] Onboarding: Swipe Up de xoa tutorial overlay.")
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+    logger.info(f"[VM {index:02d}] Onboarding handler hoan tat.")
+
+
+# ---------------------------------------------------------------------------
 # TikTok App Control
 # ---------------------------------------------------------------------------
 
@@ -341,8 +413,8 @@ def _open_tiktok(ld_console: str, index: int, package: str,
                 f"{label} XAC NHAN: TikTok dang o Foreground "
                 f"(attempt {attempt}, t={int(time.time()-deadline+TIKTOK_FOREGROUND_TIMEOUT)}s)."
             )
-            # Cho FYP load them mot chut truoc khi bat dau farm
-            time.sleep(random.uniform(2.0, 3.5))
+            # Xu ly Onboarding truoc khi bat dau farm
+            handle_onboarding(adb_exe, port, index)
             return True
 
         logger.info(f"{label} Chua thay foreground (attempt {attempt})... [{out[:80]}]")
