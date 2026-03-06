@@ -338,16 +338,45 @@ def handle_onboarding(adb_exe: str, port: int, index: int) -> None:
 
     logger.info(f"[VM {index:02d}] Bat dau xu ly Onboarding (timeout={ONBOARDING_ELEMENT_TIMEOUT}s/element)...")
 
-    # -- Click cac nut Onboarding --
-    for text in _ONBOARDING_CLICK_TEXTS:
+    # Mapping: keyword -> cac chuoi co the xuat hien tren nut (textContains hoac descriptionContains)
+    _ONBOARDING_KEYWORDS = [
+        "Agree",        # "Agree and continue" (EN) -- su dung textContains
+        "Dong y",       # "Dong y va tiep tuc" (VI fallback)
+        "Skip",         # Bo qua so thich
+        "Allow",        # Cap quyen notification
+        "Continue",     # Man hinh gioi thieu
+        "Not now",      # Popup upsell
+        "OK",           # Dialog thong bao
+    ]
+
+    # -- Click cac nut Onboarding bang Robust Dual-probe Selector --
+    for keyword in _ONBOARDING_KEYWORDS:
+        found = False
         try:
-            el = d(text=text)
+            # Probe 1: textContains (UiSelector tieu chuan)
+            el = d(textContains=keyword)
             if el.exists(timeout=ONBOARDING_ELEMENT_TIMEOUT):
+                logger.info(f"[VM {index:02d}] [ONBOARDING] Tim thay (textContains='{keyword}') -- Dang click...")
                 el.click()
-                logger.info(f"[VM {index:02d}] Onboarding: clicked '{text}'")
-                time.sleep(0.8)   # Cho animation transition
-        except Exception:
-            pass   # Element khong xuat hien, bo qua
+                time.sleep(0.8)
+                found = True
+        except Exception as exc:
+            logger.info(f"[VM {index:02d}] [ONBOARDING] textContains='{keyword}' loi: {exc}")
+
+        if not found:
+            try:
+                # Probe 2: descriptionContains (accessibility label)
+                el2 = d(descriptionContains=keyword)
+                if el2.exists(timeout=1):
+                    logger.info(f"[VM {index:02d}] [ONBOARDING] Tim thay (descContains='{keyword}') -- Dang click...")
+                    el2.click()
+                    time.sleep(0.8)
+                    found = True
+            except Exception:
+                pass
+
+        if not found:
+            logger.info(f"[VM {index:02d}] [ONBOARDING] Khong thay '{keyword}' -- bo qua.")
 
     # -- Swipe Up cuoi cung: xoa bo Tutorial Overlay neu co --
     try:
