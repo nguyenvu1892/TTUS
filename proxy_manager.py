@@ -271,18 +271,17 @@ def _find_adb(cfg: dict) -> str:
     sys.exit(1)
 
 
-def _adb_port(vm_number: int) -> int:
+def _adb_port(ldplayer_index: int) -> int:
     """
-    Tinh port ADB cho VM thu vm_number (1-based).
-    LDPlayer index = vm_number - 1 (0-based).
-    Port = 5555 + (ldplayer_index * 2).
+    Tinh port ADB tu LDPlayer index CHINH XAC (0-based) lay tu ldconsole list2.
+    Port = 5555 + (ldplayer_index * 2)
 
-    TikTok_US_01 (index=0) -> 5555
-    TikTok_US_02 (index=1) -> 5557
-    ...
-    TikTok_US_10 (index=9) -> 5573
+    Vi du:
+      index=1 -> 5557   (TikTok_US_01 neu VM goc la index 0 va bi tat)
+      index=9 -> 5573
+     index=10 -> 5575
     """
-    return ADB_BASE_PORT + ((vm_number - 1) * 2)
+    return ADB_BASE_PORT + (ldplayer_index * 2)
 
 
 def _adb_connect(adb_exe: str, port: int) -> bool:
@@ -393,6 +392,52 @@ def _is_running(ld_console: str, index: int) -> bool:
     return ok and "running" in output.lower()
 
 
+def get_running_instances(ld_console: str) -> list:
+    """
+    Lay danh sach CHINH XAC cac VM dang chay bang ldconsole runninglist.
+    Tra ve list cac dict {"index": int, "name": str} sap xep tang dan theo index.
+
+    Format output cua ldconsole runninglist:
+      index,name,top_window_handle,bind_window_handle,pid,...
+
+    Neu runninglist khong kha dung, fallback ve list2 va loc nhung VM dang running.
+    """
+    def _parse_list(output: str) -> list:
+        instances = []
+        for line in output.strip().splitlines():
+            parts = line.split(",")
+            if len(parts) >= 2:
+                try:
+                    idx  = int(parts[0].strip())
+                    name = parts[1].strip()
+                    if name:  # bo qua dong header hoac rong
+                        instances.append({"index": idx, "name": name})
+                except ValueError:
+                    continue
+        return sorted(instances, key=lambda x: x["index"])
+
+    # Thu runninglist truoc (chi tra ve VM dang chay)
+    ok, output = _ld_command(ld_console, "runninglist")
+    if ok and output.strip():
+        instances = _parse_list(output)
+        if instances:
+            logger.info(_info(f"Runninglist: {len(instances)} VM dang chay: "
+                              + ", ".join(f"{v['name']}(idx={v['index']})" for v in instances)))
+            return instances
+
+    # Fallback: list2 + isrunning check
+    logger.warning(_warn("runninglist khong kha dung, dung list2 + isrunning check."))
+    ok2, output2 = _ld_command(ld_console, "list2")
+    if not ok2 or not output2.strip():
+        logger.error(_err("Khong the lay danh sach VM tu ldconsole."))
+        return []
+
+    all_instances = _parse_list(output2)
+    running = [v for v in all_instances if _is_running(ld_console, v["index"])]
+    logger.info(_info(f"list2 + filter: {len(running)} VM dang chay."))
+    return running
+
+
 # ============================================================
 # SharedPrefs XML Builder
 # ============================================================
@@ -438,23 +483,20 @@ def install_app(ld_console: str, index_0: int, apk_path: str) -> bool:
     return ok
 
 
-def configure_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
+def configure_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict) -> bool:
     """
-    Ghi cau hinh SOCKS5 proxy truc tiep vao SharedPreferences cua SocksDroid
-    bang kiet noi ADB goc qua port localhost, chay lenh voi su -c (root).
+    Ghi cau hinh SOCKS5 proxy vao SharedPreferences cua SocksDroid bang Direct ADB Root.
 
-    Port: 5555 + ((vm_number - 1) * 2)
-    Quy trinh:
-      1. adb connect 127.0.0.1:<port>
-      2. su -c force-stop SocksDroid
-      3. su -c mkdir SharedPrefs dir
-      4. su -c ghi XML file bang printf
-      5. su -c chmod 660 + chown
-      6. su -c am start SocksDroid
+    Args:
+        ldplayer_index: Index CHINH XAC tu ldconsole (0-based), dung de tinh port.
+        vm_name:        Ten may ao (de log).
+        proxy:          dict {ip, port, user, pass}
+
+    Port = 5555 + (ldplayer_index * 2)
     """
-    port   = _adb_port(vm_number)
+    port   = _adb_port(ldplayer_index)
     serial = f"127.0.0.1:{port}"
-    label  = f"[VM {vm_number:02d}] [{serial}]"
+    label  = f"[{vm_name}] [idx={ldplayer_index}] [{serial}]"
 
     logger.info(f"{label} Dang cau hinh proxy -> {proxy['ip']}:{proxy['port']} ...")
 
@@ -471,7 +513,6 @@ def configure_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
     _adb_shell_su(adb_exe, port, f"mkdir -p {SOCKSDROID_PREFS_DIR}")
 
     # 4. Ghi XML SharedPrefs dung base64 -- tranh 100% van de escape ky tu dac biet
-    #    Cach: Python ma hoa XML -> base64 string; Android giai ma bang: echo <b64> | base64 -d
     xml_content = (
         "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>"
         "<map>"
@@ -484,13 +525,13 @@ def configure_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
         "<boolean name='per_app' value='false' />"
         "</map>"
     )
-    b64_xml = base64.b64encode(xml_content.encode("utf-8")).decode("ascii")
+    b64_xml   = base64.b64encode(xml_content.encode("utf-8")).decode("ascii")
     write_cmd = f"echo {b64_xml} | base64 -d > {SOCKSDROID_PREFS_FILE}"
 
     ok_write, out_write = _adb_shell_su(adb_exe, port, write_cmd, timeout=15)
     if not ok_write:
         logger.error(_err(f"{label} Ghi SharedPrefs that bai: {out_write[:120]}"))
-        logger.error(_err(f"{label} Kiem tra: 1) Root bat chua? 2) port {port} dung chua? 3) adb connect OK chua?"))
+        logger.error(_err(f"{label} Kiem tra: 1) Root bat chua? 2) port {port} dung chua?"))
         return False
 
     # 5. Set quyen file va owner
@@ -504,19 +545,23 @@ def configure_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
     if ok_start:
         logger.info(_ok(f"{label} Cau hinh proxy va khoi dong SocksDroid thanh cong."))
     else:
-        logger.warning(_warn(f"{label} Ghi SharedPrefs OK nhung am start that bai. Thu mo app thu cong."))
+        logger.warning(_warn(f"{label} Ghi SharedPrefs OK nhung am start that bai."))
 
     return True
 
 
-def verify_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
+def verify_proxy(adb_exe: str, ldplayer_index: int, vm_name: str, proxy: dict) -> bool:
     """
     Xac minh proxy da duoc nap vao SocksDroid bang cach doc lai SharedPrefs.
+
+    Args:
+        ldplayer_index: Index CHINH XAC tu ldconsole (de tinh port).
+        vm_name:        Ten may ao (de log).
     Returns True neu IP + Port co mat trong file.
     """
-    port   = _adb_port(vm_number)
+    port   = _adb_port(ldplayer_index)
     serial = f"127.0.0.1:{port}"
-    label  = f"[VM {vm_number:02d}] [{serial}]"
+    label  = f"[{vm_name}] [idx={ldplayer_index}] [{serial}]"
 
     logger.info(f"{label} Dang xac minh proxy ({proxy['ip']}:{proxy['port']}) ...")
 
@@ -527,8 +572,7 @@ def verify_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
     ok, output = _adb_shell_su(adb_exe, port,
                                 f"cat {SOCKSDROID_PREFS_FILE} 2>/dev/null")
     if not ok or not output.strip():
-        logger.error(_err(f"{label} VERIFY FAIL: Khong doc duoc SharedPrefs. "
-                          f"Root chua hoat dong hoac file chua duoc ghi."))
+        logger.error(_err(f"{label} VERIFY FAIL: Khong doc duoc SharedPrefs."))
         return False
 
     ip_ok   = proxy["ip"]   in output
@@ -540,7 +584,7 @@ def verify_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
     else:
         logger.error(_err(
             f"{label} VERIFY FAIL: IP_found={ip_ok}, Port_found={port_ok}.\n"
-            f"SharedPrefs hien tai: {output[:200]}"
+            f"SharedPrefs: {output[:200]}"
         ))
         return False
 
@@ -573,68 +617,88 @@ def install_all(cfg: dict, proxies: list) -> None:
 
 
 def configure_all(cfg: dict, proxies: list) -> None:
-    """Cau hinh SOCKS5 proxy cho tat ca VM qua Direct ADB."""
-    adb_exe = cfg["_ADB_EXE"]
-    count   = cfg["INSTANCE_COUNT"]
+    """
+    Cau hinh SOCKS5 proxy cho tat ca VM DANG CHAY bang Direct ADB.
+    Lay danh sach VM thuc te tu ldconsole runninglist (khong hardcode index).
+    """
+    ld_console = cfg["_LD_CONSOLE"]
+    adb_exe    = cfg["_ADB_EXE"]
 
-    if len(proxies) < count:
-        logger.error(_err(f"Can {count} proxy, hien co {len(proxies)}. Kiem tra {PROXIES_FILE}."))
+    # Lay danh sach VM dang chay voi index CHINH XAC
+    running = get_running_instances(ld_console)
+    if not running:
+        logger.error(_err("Khong co VM nao dang chay. Hay khoi dong 10 VM truoc."))
+        sys.exit(1)
+
+    if len(proxies) < len(running):
+        logger.error(_err(f"Can {len(running)} proxy, hien co {len(proxies)}. Kiem tra {PROXIES_FILE}."))
         sys.exit(1)
 
     print(_info("=" * 64))
-    print(_info(f"  BAT DAU: Cau hinh proxy (Direct ADB su -c) cho {count} VM ..."))
-    print(_info(f"  Port range: {_adb_port(1)} -- {_adb_port(count)}"))
+    print(_info(f"  BAT DAU: Cau hinh proxy cho {len(running)} VM dang chay ..."))
+    for vm in running:
+        port = _adb_port(vm["index"])
+        print(_info(f"    {vm['name']:<20} idx={vm['index']} port={port}"))
     print(_info("=" * 64))
 
     success, failed = 0, 0
-    for i in range(1, count + 1):
-        proxy = proxies[i - 1]
-        ok    = configure_proxy(adb_exe, i, proxy)
+    for seq, vm in enumerate(running):
+        proxy = proxies[seq]  # ghep tuan tu: VM thu seq -> proxy thu seq
+        ok    = configure_proxy(adb_exe, vm["index"], vm["name"], proxy)
         if ok:
             success += 1
         else:
             failed += 1
-        if i < count:
+        if seq < len(running) - 1:
             time.sleep(CONFIGURE_DELAY_SEC)
 
-    summary = f"CONFIGURE XONG: {success} thanh cong / {failed} that bai / {count} tong"
+    summary = f"CONFIGURE XONG: {success} thanh cong / {failed} that bai / {len(running)} tong"
     logger.info(_ok(summary) if failed == 0 else _warn(summary))
 
 
 def verify_all(cfg: dict, proxies: list) -> dict:
-    """Xac minh proxy da duoc nap tren tat ca VM. Tra ve dict ket qua."""
-    adb_exe = cfg["_ADB_EXE"]
-    count   = cfg["INSTANCE_COUNT"]
+    """
+    Xac minh proxy tren tat ca VM dang chay. Tra ve dict {vm_name: OK/FAIL}.
+    Lay danh sach VM thuc te tu ldconsole runninglist.
+    """
+    ld_console = cfg["_LD_CONSOLE"]
+    adb_exe    = cfg["_ADB_EXE"]
 
-    if len(proxies) < count:
-        logger.error(_err(f"Can {count} proxy de verify."))
+    running = get_running_instances(ld_console)
+    if not running:
+        logger.error(_err("Khong co VM nao dang chay."))
+        return {}
+
+    if len(proxies) < len(running):
+        logger.error(_err(f"Can {len(running)} proxy de verify."))
         sys.exit(1)
 
     print(_info("=" * 64))
-    print(_info(f"  VERIFY: Kiem tra SharedPrefs tren {count} VM ..."))
+    print(_info(f"  VERIFY: Kiem tra SharedPrefs tren {len(running)} VM ..."))
     print(_info("=" * 64))
 
     results = {}
-    for i in range(1, count + 1):
-        ok = verify_proxy(adb_exe, i, proxies[i - 1])
-        results[f"TikTok_US_{i:02d}"] = "OK" if ok else "FAIL"
+    for seq, vm in enumerate(running):
+        ok = verify_proxy(adb_exe, vm["index"], vm["name"], proxies[seq])
+        results[vm["name"]] = "OK" if ok else "FAIL"
 
     ok_count   = sum(1 for v in results.values() if v == "OK")
-    fail_count = count - ok_count
-    logger.info(_ok(f"VERIFY XONG: {ok_count} OK / {fail_count} FAIL / {count} tong")
+    fail_count = len(running) - ok_count
+    logger.info(_ok(f"VERIFY XONG: {ok_count} OK / {fail_count} FAIL / {len(running)} tong")
                 if fail_count == 0 else
-                _warn(f"VERIFY XONG: {ok_count} OK / {fail_count} FAIL / {count} tong"))
+                _warn(f"VERIFY XONG: {ok_count} OK / {fail_count} FAIL / {len(running)} tong"))
 
+    # In bang ket qua
     print()
-    print(f"  {'VM':<20} {'Port':<8} {'Proxy':<35} {'Status'}")
-    print("  " + "-" * 72)
-    for i in range(1, count + 1):
-        name   = f"TikTok_US_{i:02d}"
-        proxy  = proxies[i - 1]
-        port   = _adb_port(i)
-        status = results[name]
+    print(f"  {'VM':<20} {'Idx':<5} {'Port':<7} {'Proxy':<35} {'Status'}")
+    print("  " + "-" * 78)
+    for seq, vm in enumerate(running):
+        port   = _adb_port(vm["index"])
+        proxy  = proxies[seq]
+        status = results.get(vm["name"], "?")
         color  = _ok(status) if status == "OK" else _err(status)
-        print(f"  {name:<20} {port:<8} {proxy['ip']}:{proxy['port']:<26} {color}")
+        print(f"  {vm['name']:<20} {vm['index']:<5} {port:<7} "
+              f"{proxy['ip']}:{proxy['port']:<26} {color}")
     print()
     return results
 
