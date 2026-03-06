@@ -54,6 +54,7 @@ _bootstrap_deps()
 # ============================================================
 # IMPORTS
 # ============================================================
+import base64
 import json
 import logging
 import os
@@ -310,14 +311,20 @@ def _adb_connect(adb_exe: str, port: int) -> bool:
 
 def _adb_shell_su(adb_exe: str, port: int, shell_cmd: str, timeout: int = 30) -> tuple:
     """
-    Chay lenh shell voi quyen root tren may ao qua ADB truc tiep.
-    Lenh: adb -s 127.0.0.1:<port> shell su -c '<shell_cmd>'
+    Chay lenh shell voi quyen root (su) tren may ao qua ADB truc tiep.
+
+    Cach truyen dung:
+      adb -s 127.0.0.1:<port> shell "su -c '<shell_cmd>'"
+
+    Luu y: Phai gop "su -c 'cmd'" thanh MOT string duy nhat cho adb shell,
+    khong duoc tach thanh nhieu args rieng le (su, -c, cmd).
 
     Returns: (success: bool, output: str)
     """
-    serial = f"127.0.0.1:{port}"
-    # Wrap shell_cmd trong dau ngoac kep de su -c xu ly dung
-    full_cmd = [adb_exe, "-s", serial, "shell", "su", "-c", shell_cmd]
+    serial   = f"127.0.0.1:{port}"
+    # Boc shell_cmd vao dau phay don, gop su + -c + cmd thanh 1 string
+    su_cmd   = f"su -c '{shell_cmd}'"
+    full_cmd = [adb_exe, "-s", serial, "shell", su_cmd]
     try:
         result = subprocess.run(
             full_cmd,
@@ -326,7 +333,6 @@ def _adb_shell_su(adb_exe: str, port: int, shell_cmd: str, timeout: int = 30) ->
             timeout=timeout,
         )
         output = (result.stdout + result.stderr).strip()
-        # su loi thu'ong tra ve exit code != 0 hoac co "Permission denied"
         if result.returncode != 0 or "Permission denied" in output:
             logger.warning(_warn(f"[{serial}] su -c that bai (rc={result.returncode}): {output[:120]}"))
             return False, output
@@ -464,54 +470,31 @@ def configure_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
     # 3. Tao thu muc SharedPrefs
     _adb_shell_su(adb_exe, port, f"mkdir -p {SOCKSDROID_PREFS_DIR}")
 
-    # 4. Ghi XML SharedPrefs bang printf (an toan voi cac ky tu dac biet trong password)
-    ip   = proxy["ip"].replace("'", "\\'").replace('"', '\\"')
-    port_str = str(proxy["port"])
-    user = proxy["user"].replace("'", "\\'").replace('"', '\\"')
-    pwd  = proxy["pass"].replace("'", "\\'").replace('"', '\\"')
-
+    # 4. Ghi XML SharedPrefs dung base64 -- tranh 100% van de escape ky tu dac biet
+    #    Cach: Python ma hoa XML -> base64 string; Android giai ma bang: echo <b64> | base64 -d
     xml_content = (
         "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>"
         "<map>"
-        f"<string name='proxy_server'>{ip}</string>"
-        f"<string name='proxy_port'>{port_str}</string>"
-        f"<string name='proxy_username'>{user}</string>"
-        f"<string name='proxy_password'>{pwd}</string>"
+        f"<string name='proxy_server'>{proxy['ip']}</string>"
+        f"<string name='proxy_port'>{proxy['port']}</string>"
+        f"<string name='proxy_username'>{proxy['user']}</string>"
+        f"<string name='proxy_password'>{proxy['pass']}</string>"
         "<boolean name='ipv6' value='false' />"
         "<boolean name='udp_forward' value='false' />"
         "<boolean name='per_app' value='false' />"
         "</map>"
     )
-    # Dung printf voi echo de tranh van de xuong dong
-    write_cmd = f"echo {repr(xml_content)} > {SOCKSDROID_PREFS_FILE}"
-    # Su dung cat heredoc thay vi echo de an toan hon
-    write_cmd = (
-        f"printf '%s' "
-        f'"{xml_content.replace(chr(34), chr(92)+chr(34))}" '
-        f"> {SOCKSDROID_PREFS_FILE}"
-    )
-    ok_write, out_write = _adb_shell_su(adb_exe, port, write_cmd)
+    b64_xml = base64.b64encode(xml_content.encode("utf-8")).decode("ascii")
+    write_cmd = f"echo {b64_xml} | base64 -d > {SOCKSDROID_PREFS_FILE}"
+
+    ok_write, out_write = _adb_shell_su(adb_exe, port, write_cmd, timeout=15)
     if not ok_write:
-        # Thu cach viet don gian hon: dung cat voi stdin
-        # Tao XML khong co dau ngoac kep ben trong de de escape
-        simple_write = (
-            f"echo \"<?xml version='1.0' encoding='utf-8' standalone='yes' ?>"
-            f"<map>"
-            f"<string name='proxy_server'>{ip}</string>"
-            f"<string name='proxy_port'>{port_str}</string>"
-            f"<string name='proxy_username'>{user}</string>"
-            f"<string name='proxy_password'>{pwd}</string>"
-            f"</map>\" > {SOCKSDROID_PREFS_FILE}"
-        )
-        ok_write, out_write = _adb_shell_su(adb_exe, port, simple_write)
-        if not ok_write:
-            logger.error(_err(f"{label} Ghi SharedPrefs that bai: {out_write[:120]}"))
-            logger.error(_err(f"{label} Kiem tra: 1) Root da bat chua? 2) ADB daemon chay chua? 3) Dung port {port}?"))
-            return False
+        logger.error(_err(f"{label} Ghi SharedPrefs that bai: {out_write[:120]}"))
+        logger.error(_err(f"{label} Kiem tra: 1) Root bat chua? 2) port {port} dung chua? 3) adb connect OK chua?"))
+        return False
 
     # 5. Set quyen file va owner
     _adb_shell_su(adb_exe, port, f"chmod 660 {SOCKSDROID_PREFS_FILE}")
-    # Lay owner cua thu muc package va gan cho file prefs
     _adb_shell_su(adb_exe, port,
                   f"chown $(stat -c '%u:%g' {SOCKSDROID_PREFS_DIR}) {SOCKSDROID_PREFS_FILE}")
 
@@ -521,9 +504,9 @@ def configure_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
     if ok_start:
         logger.info(_ok(f"{label} Cau hinh proxy va khoi dong SocksDroid thanh cong."))
     else:
-        logger.warning(_warn(f"{label} Ghi SharedPrefs OK nhung am start that bai. Kiem tra thu cong."))
+        logger.warning(_warn(f"{label} Ghi SharedPrefs OK nhung am start that bai. Thu mo app thu cong."))
 
-    return True  # Thanh cong neu ghi duoc SharedPrefs
+    return True
 
 
 def verify_proxy(adb_exe: str, vm_number: int, proxy: dict) -> bool:
