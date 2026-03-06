@@ -314,9 +314,15 @@ def _open_tiktok(ld_console: str, index: int, package: str,
     label = f"[VM {index:02d}] [{package}]"
     logger.info(f"{label} Dang mo TikTok...")
 
-    # Gui lenh am start
-    cmd = f"am start -n {package}/.main.MainActivity"
-    _adb(ld_console, index, cmd)
+    # Dung monkey de tim va mo LAUNCHER Activity (khong can biet ten Activity class)
+    # Stdout cua monkey bi suppress hoan toan (capture_output=True ben trong _adb_shell)
+    monkey_cmd = (
+        f"monkey -p {package} -c android.intent.category.LAUNCHER 1"
+    )
+    ok, out = _adb_shell(adb_exe, port, monkey_cmd, timeout=15)
+    if not ok:
+        logger.error(f"{label} Lenh monkey that bai (rc!=0): {out[:120]}")
+        return False
 
     # Vong lap xac nhan foreground ("Mat Than")
     deadline = time.time() + TIKTOK_FOREGROUND_TIMEOUT
