@@ -413,6 +413,22 @@ TIKTOK_FOREGROUND_TIMEOUT = 15   # Giay cho TikTok len foreground
 TIKTOK_FOREGROUND_POLL   = 2    # Tan suat check (giay)
 
 
+def dismiss_launcher_ads(adb_exe: str, port: int, index: int) -> None:
+    """
+    Giai phong man hinh khoi popup quang cao / overlay cua LDPlayer
+    bang cach bam Back x2 roi Home.
+
+    Goi nay su dung ADB keyevent thuan tuy (khong can uiautomator2),
+    nen luon hoat dong ke ca khi man hinh dang bi che phu hoan toan.
+    """
+    label = f"[VM {index:02d}]"
+    logger.info(f"{label} [ADS-CLEAR] Bam Back x2 + Home de don quang cao LDPlayer...")
+    for keyevent in ("4", "4", "3"):   # 4 = KEYCODE_BACK, 3 = KEYCODE_HOME
+        _adb_shell(adb_exe, port, f"input keyevent {keyevent}", timeout=5)
+        time.sleep(1.0)
+    logger.info(f"{label} [ADS-CLEAR] Man hinh da reset ve Home.")
+
+
 def _open_tiktok(ld_console: str, index: int, package: str,
                  adb_exe: str, port: int) -> bool:
     """
@@ -427,6 +443,9 @@ def _open_tiktok(ld_console: str, index: int, package: str,
     """
     label = f"[VM {index:02d}] [{package}]"
     logger.info(f"{label} Dang mo TikTok...")
+
+    # Buoc 0: Don sach man hinh (quang cao / overlay LDPlayer) truoc khi mo app
+    dismiss_launcher_ads(adb_exe, port, index)
 
     # Dung monkey de tim va mo LAUNCHER Activity (khong can biet ten Activity class)
     # Stdout cua monkey bi suppress hoan toan (capture_output=True ben trong _adb_shell)
