@@ -980,9 +980,9 @@ def main():
     valid = ("start", "session", "wake", "preflight")
     if len(sys.argv) < 2 or sys.argv[1] not in valid:
         print(f"\nCach dung: python {os.path.basename(__file__)} <command> [from N] [to M]\n")
-        print("  start [from N] [to M]  -- Full pipeline (Wake->Preflight->Farm)")
-        print("    VD: start            -> chay VM index 1 den 10 (mac dinh)")
-        print("    VD: start from 1 to 5 -> chi chay VM index 1, 2, 3, 4, 5")
+        print("  start [from N] [to M]  -- Full pipeline (Wake->Preflight->Farm) [mac dinh: VM 1-5]")
+        print("    VD: start            -> chay VM index 1 den 5 (TEST MODE mac dinh)")
+        print("    VD: start from 1 to 10 -> chay toan bo 10 VM (Production mode)")
         print("  session <n>            -- Chay 1 phien thu cho VM index n")
         print("  wake [from N] [to M]   -- Chi chay Buoc 1: Auto-Wake")
         print("  preflight              -- Chi chay Buoc 2: Pre-flight check\n")
@@ -992,8 +992,9 @@ def main():
     cfg     = load_config()
     proxies = load_proxies()
 
-    # Parse optional [from N] [to M] args cho start va wake
-    def _parse_range(argv, default_start=1, default_end=10):
+    # TEST MODE: Mac dinh chi chay 5 VM dau (VM 1-5).
+    # De chay toan bo 10 VM, goi: python tiktok_farmer.py start from 1 to 10
+    def _parse_range(argv, default_start=1, default_end=5):
         """Trich xuat 'from N to M' tu argv. Vi du: ['start', 'from', '1', 'to', '5']"""
         s, e = default_start, default_end
         try:
