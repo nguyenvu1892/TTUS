@@ -273,11 +273,11 @@ def configure_all_instances() -> None:
 # Cac tham so toi uu cho moi truong Farm (TikTok + SocksDroid)
 _OPTIMIZE_SETTINGS = {
     # --- Hieu nang (toi thieu cho Farm) ---
-    "advancedSettings.cpuCount"     : 2,       # 2 core du chay SocksDroid+TikTok
-    "advancedSettings.memorySize"   : 1536,    # 1536MB: toi thieu tranh OOM kill
+    "advancedSettings.cpuCount"     : 4,       # 4 core -- test luong Core Flow mượt
+    "advancedSettings.memorySize"   : 3072,    # 3072MB -- TikTok load video khong bi khung
     "advancedSettings.resolution"   : {"width": 720, "height": 1280},
     "advancedSettings.resolutionDpi": 240,     # DPI nhe hon (320 -> 240)
-    "basicSettings.fps"             : 20,      # 20fps tiet kiem CPU
+    "basicSettings.fps"             : 30,      # 30fps -- mượt hơn cho test phase
     "advancedSettings.micphoneName" : "",      # Tat mic
     "advancedSettings.speakerName"  : "",      # Tat speaker
     # --- Moi truong US (Language / GPS) ---
